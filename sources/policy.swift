@@ -284,6 +284,50 @@ struct CoolingPolicy {
     }
 }
 
+/// A fan-mode request from a baadgir:// link, Shortcuts, or the command line.
+/// It goes through the same checks as choosing the mode in the app.
+enum RemoteCommand: Equatable {
+    case auto, curve, maximum
+    case manual(rpm: Double?)
+    init(url: URL) throws {
+        guard url.scheme?.lowercased() == "baadgir", let name = url.host?.lowercased() else {
+            throw Failure("Not a Baadgir link")
+        }
+        let rpm = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "rpm" }?.value
+        switch name {
+        case "auto": self = .auto
+        case "curve": self = .curve
+        case "max", "maximum": self = .maximum
+        case "manual":
+            guard let rpm else { self = .manual(rpm: nil); return }
+            guard let value = Double(rpm), value.isFinite else { throw Failure("Invalid RPM in link: \(rpm)") }
+            self = .manual(rpm: value)
+        default: throw Failure("Unknown Baadgir command: \(name)")
+        }
+    }
+    /// Parses command-line words such as `max` or `manual 3000`.
+    init(arguments: [String]) throws {
+        switch arguments.map({ $0.lowercased() }) {
+        case ["auto"]: self = .auto
+        case ["curve"]: self = .curve
+        case ["max"], ["maximum"]: self = .maximum
+        case ["manual"]: self = .manual(rpm: nil)
+        case let words where words.count == 2 && words[0] == "manual":
+            guard let rpm = Double(words[1]), rpm.isFinite else { throw Failure("Invalid RPM: \(words[1])") }
+            self = .manual(rpm: rpm)
+        default: throw Failure("Unknown command")
+        }
+    }
+    var url: URL {
+        switch self {
+        case .auto: return URL(string: "baadgir://auto")!
+        case .curve: return URL(string: "baadgir://curve")!
+        case .maximum: return URL(string: "baadgir://max")!
+        case .manual(let rpm): return URL(string: "baadgir://manual" + (rpm.map { "?rpm=\(Int($0.rounded()))" } ?? ""))!
+        }
+    }
+}
+
 /// Fixed-size, oldest-first history kept in memory only. Never written to disk.
 struct RingBuffer<Element> {
     let capacity: Int

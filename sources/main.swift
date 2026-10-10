@@ -435,6 +435,32 @@ final class CoolingModel: ObservableObject {
     }
     @Published var hotKeyError: String?
     var onHotKeyChange: (() -> Void)?
+    /// Whether baadgir:// links (and so Shortcuts and the command line) may change the fan mode.
+    @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? true {
+        didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
+    }
+    /// Runs a request from a link, Shortcuts, or the command line, with the same checks as the popover.
+    func perform(_ command: RemoteCommand) {
+        guard allowsLinks else {
+            message = "Links, Shortcuts and the command line are turned off in Settings."; onUpdate?(); return
+        }
+        switch command {
+        case .auto: select(.auto)
+        case .curve: select(.curve)
+        case .maximum: select(.maximum)
+        case .manual(let rpm):
+            if let rpm {
+                guard sliderRange.contains(rpm) else {
+                    message = "Choose a speed within \(Int(sliderRange.lowerBound))–\(Int(sliderRange.upperBound)) RPM."
+                    onUpdate?(); return
+                }
+                selectedRPM = rpm
+            }
+            select(.manual)
+        }
+    }
+    /// True once the first sensor read has finished, so queued link requests see real readings.
+    @Published private(set) var hasRead = false
     @Published var colorsTemperatures = UserDefaults.standard.object(forKey: "colorsTemperatures") as? Bool ?? true {
         didSet { defaults.set(colorsTemperatures, forKey: "colorsTemperatures"); onUpdate?() }
     }
@@ -585,6 +611,7 @@ final class CoolingModel: ObservableObject {
             DispatchQueue.main.async {
                 self.reading = false
                 self.fans = fans; self.temperatures = temperatures; self.power = power; self.sensorError = errorMessage
+                self.hasRead = true
                 self.history.append(HistorySample(cpu: temperatures?.cpu, gpu: temperatures?.gpu,
                     fan: fans.isEmpty ? nil : fans.map { Double($0.rpm) }.reduce(0, +) / Double(fans.count)))
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
@@ -895,6 +922,7 @@ struct SettingsView: View {
                 }
                 Toggle("Notify when fans return to Auto on their own", isOn: $model.notifiesOnReturn)
                 Toggle("⌃⌥M switches between Max and Auto", isOn: $model.usesMaxHotKey)
+                Toggle("Allow Shortcuts, baadgir:// links and the command line to change fan mode", isOn: $model.allowsLinks)
                 if let error = model.hotKeyError {
                     Text(error).font(.caption).foregroundStyle(.orange)
                 }
@@ -1102,7 +1130,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         host.sizingOptions = .preferredContentSize
         popover.contentViewController = host
         model.onMenuBarLayoutChange = { [weak self] in self?.layoutPending = true; self?.refreshStatusItem() }
-        model.onUpdate = { [weak self] in self?.refreshStatusItem() }
+        model.onUpdate = { [weak self] in self?.refreshStatusItem(); self?.runQueuedCommands() }
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.model.refresh() }
         RunLoop.main.add(timer!, forMode: .common)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
@@ -1132,9 +1160,30 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
                                          GetApplicationEventTarget(), 0, &hotKey)
         if status != noErr { model.hotKeyError = "⌃⌥M is already used by another app." }
     }
+    private var queuedCommands: [RemoteCommand] = []
+    /// Handles baadgir:// links from Shortcuts, the command line, or other apps.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            do { queuedCommands.append(try RemoteCommand(url: url)) }
+            catch { model.message = String(describing: error); showMessage() }
+        }
+        runQueuedCommands()
+    }
+    /// Waits for the first sensor read so a link that launched the app isn't refused for missing readings.
+    private func runQueuedCommands() {
+        guard model.hasRead, !queuedCommands.isEmpty else { return }
+        let commands = queuedCommands
+        queuedCommands = []
+        for command in commands { model.perform(command) }
+        showMessage()
+    }
+    /// Opens the popover when a request from outside it was refused, so the reason is visible.
+    private func showMessage() {
+        if model.message != nil, !popover.isShown { togglePopover() }
+    }
     private func toggleMaximum() {
         model.select(model.displayedMode == .maximum ? .auto : .maximum)
-        if model.message != nil, !popover.isShown { togglePopover() }
+        showMessage()
     }
     // Menu bar apps count as active while their popover is open; show banners anyway.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
@@ -1317,8 +1366,24 @@ func diagnostic() -> String {
     } catch { return "Read-only diagnostic failed: \(error)" }
 }
 let arguments = CommandLine.arguments
-// No logs: nothing here writes readings to disk. `--probe` prints to the terminal only.
-if arguments.contains("--probe") {
+let usage = """
+Usage: baadgir status | auto | curve | max | manual [RPM]
+  status        Print fan and sensor readings (read-only).
+  auto … max    Ask the running Baadgir app to change fan mode, with the same checks as the app.
+"""
+/// Sends a request to this Baadgir.app (launching it if needed) through its baadgir:// link.
+func send(_ command: RemoteCommand) -> Int32 {
+    let open = Process()
+    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    // Resolve a symlink such as /usr/local/bin/baadgir back to this app, not another copy.
+    let executable = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let bundle = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    open.arguments = ["-g"] + (bundle.pathExtension == "app" ? ["-a", bundle.path] : []) + [command.url.absoluteString]
+    do { try open.run(); open.waitUntilExit() } catch { fputs("\(error)\n", stderr); return 1 }
+    return open.terminationStatus
+}
+// No logs: nothing here writes readings to disk. `--probe` and `status` print to the terminal only.
+if arguments.contains("--probe") || arguments.dropFirst() == ["status"] {
     print(diagnostic())
 } else if arguments.count == 4 && arguments[1] == "--control" {
     do {
@@ -1329,6 +1394,11 @@ if arguments.contains("--probe") {
     if geteuid() == 0 { watchdog() }
 } else if arguments.count == 2 && arguments[1] == "--restore" {
     do { try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
+} else if arguments.count >= 2, let command = try? RemoteCommand(arguments: Array(arguments.dropFirst())) {
+    exit(send(command))
+} else if arguments.count >= 2, !arguments[1].hasPrefix("-") {
+    // Plain words are commands; anything starting with "-" may come from macOS when it launches the app.
+    fputs(usage + "\n", stderr); exit(arguments[1] == "help" ? 0 : 2)
 } else {
     let app = NSApplication.shared
     let delegate = MenuApp()

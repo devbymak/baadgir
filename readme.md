@@ -17,6 +17,7 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 - Fan curve: four editable temperature → RPM points with a live preview. Curve mode only takes over when the curve asks for more than macOS is running, and never runs a fan below the speed macOS had chosen.
 - Optional notification when fans return to Auto on their own (safety cutoff, sensor failure, helper exit), with the reason.
 - ⌃⌥M switches between Max and Auto from any app (can be turned off in Settings).
+- Shortcuts, links and command line: `baadgir://auto`, `baadgir://curve`, `baadgir://max`, `baadgir://manual?rpm=3000`, or `baadgir status | auto | curve | max | manual [RPM]`. Requests get the same safety checks as the app, and can be turned off in Settings.
 - Live manual-speed slider with editable, remembered minimum and maximum RPM limits.
 - One administrator prompt per session; speed and mode changes inside a session need no new prompt.
 - Automatic-control restoration attempted on Auto, quit, sleep, app crash or freeze, and monitoring failure.
@@ -33,6 +34,16 @@ open Baadgir.app
 ```
 
 Fan control requires macOS administrator authorization. Monitoring does not.
+
+### Shortcuts and the command line
+
+In Shortcuts, add an **Open URLs** action with a link such as `baadgir://max`. For the terminal, link the executable onto your `PATH`:
+
+```sh
+ln -s "$PWD/Baadgir.app/Contents/MacOS/baadgir" /usr/local/bin/baadgir
+baadgir status        # read-only readings
+baadgir manual 3000   # asks the running app; it launches if needed
+```
 
 ## Safety
 

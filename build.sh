@@ -25,6 +25,10 @@ cat > 'Baadgir.app/Contents/Info.plist' <<'PLIST'
 <key>CFBundleShortVersionString</key><string>0.3.0</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
+<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>local.baadgir</string>
+<key>CFBundleURLSchemes</key><array><string>baadgir</string></array>
+</dict></array>
 </dict></plist>
 PLIST
 codesign --force --sign - 'Baadgir.app'

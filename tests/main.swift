@@ -171,4 +171,18 @@ check(plugged.text == "25.8 W · adapter 28.3 W", "Power text with adapter")
 try check(try PowerReadings(system: 9, adapter: 0.1).adapter == nil, "Ignore adapter trickle when unplugged")
 rejects("Invalid power reading") { _ = try PowerReadings(system: .nan, adapter: nil) }
 rejects("Implausible power reading") { _ = try PowerReadings(system: 900, adapter: nil) }
+for (text, command) in [("baadgir://auto", RemoteCommand.auto), ("baadgir://curve", .curve), ("BAADGIR://Max", .maximum),
+                        ("baadgir://maximum", .maximum), ("baadgir://manual", .manual(rpm: nil)),
+                        ("baadgir://manual?rpm=3000", .manual(rpm: 3000))] {
+    try check(try RemoteCommand(url: URL(string: text)!) == command, "Link \(text)")
+    try check(try RemoteCommand(url: command.url) == command, "Link round trip \(text)")
+}
+for text in ["https://max", "baadgir://off", "baadgir://manual?rpm=fast", "baadgir://manual?rpm=nan", "baadgir:max"] {
+    rejects("Bad link \(text)") { _ = try RemoteCommand(url: URL(string: text)!) }
+}
+try check(try RemoteCommand(arguments: ["manual", "2500"]) == .manual(rpm: 2500), "Command-line manual speed")
+try check(try RemoteCommand(arguments: ["MAX"]) == .maximum, "Command-line words ignore case")
+for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["off"]] {
+    rejects("Bad command \(words)") { _ = try RemoteCommand(arguments: words) }
+}
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
