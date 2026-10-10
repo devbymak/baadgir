@@ -236,18 +236,44 @@ struct FanCurve: Equatable {
             }
         }
     }
-    /// A gentle default spread across the hardware range.
-    static func standard(for hardware: HardwareBounds) -> FanCurve {
-        let low = ceil(hardware.minimum), high = floor(hardware.maximum)
-        let speeds = [0.0, 0.3, 0.65, 1].map { ((low + (high - low) * $0) / 50).rounded(.down) * 50 }
-        return try! FanCurve(zip([55.0, 65, 72, 78], speeds).map { Point(temperature: $0, rpm: max(low, $1)) })
-    }
     func rpm(at temperature: Double) -> Double {
         guard temperature > points.first!.temperature else { return points.first!.rpm }
         for (a, b) in zip(points, points.dropFirst()) where temperature <= b.temperature {
             return a.rpm + (b.rpm - a.rpm) * (temperature - a.temperature) / (b.temperature - a.temperature)
         }
         return points.last!.rpm
+    }
+}
+
+/// Ready-made curves to start from. System is the default.
+enum CurvePreset: CaseIterable {
+    /// On the safe minimum: Curve never wants more than macOS until the floor does, so the fans keep macOS's own
+    /// cooling and only get the extra margin when hot.
+    case system
+    /// Starts early and spreads the whole range from 55°C to 78°C.
+    case balanced
+    /// Starts at 45°C and reaches maximum at 72°C, trading quiet for lower temperatures.
+    case performance
+    var name: String {
+        switch self {
+        case .system: return "System"
+        case .balanced: return "Balanced"
+        case .performance: return "Performance"
+        }
+    }
+    func curve(for hardware: HardwareBounds) -> FanCurve {
+        let temperatures: [Double], shares: [Double]
+        switch self {
+        case .system: (temperatures, shares) = ([55, 65, 72, 78], [0, 0, 0, 0])
+        case .balanced: (temperatures, shares) = ([55, 65, 72, 78], [0, 0.3, 0.65, 1])
+        case .performance: (temperatures, shares) = ([45, 55, 65, 72], [0.2, 0.45, 0.75, 1])
+        }
+        let low = ceil(hardware.minimum), high = floor(hardware.maximum)
+        // Round numbers where they fit, never below the safe minimum, which both only rise with temperature.
+        return try! FanCurve(zip(temperatures, shares).map { temperature, share in
+            let rpm = ((low + (high - low) * share) / 50).rounded(.down) * 50
+            return FanCurve.Point(temperature: temperature, rpm: max(low, rpm, SafeMinimum.rpm(at: temperature, hardware: hardware)))
+        })
     }
 }
 

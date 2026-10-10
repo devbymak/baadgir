@@ -722,7 +722,12 @@ final class CoolingModel: ObservableObject {
         fillingCurve = false
         curveChanged()
     }
-    func resetCurve() { if let bounds { showCurve(.standard(for: bounds)) } }
+    func applyCurvePreset(_ preset: CurvePreset) { if let bounds { showCurve(preset.curve(for: bounds)) } }
+    /// The preset the running curve matches, or nil once it has been edited.
+    var curvePreset: CurvePreset? {
+        guard let curve, let bounds else { return nil }
+        return CurvePreset.allCases.first { $0.curve(for: bounds) == curve }
+    }
     /// Moves one point of the running curve by hand. Kept between its neighbours and on or above the safe minimum, so
     /// every position a drag reaches is a valid curve. Temperatures snap to whole degrees, speeds to 10 RPM.
     func moveCurvePoint(_ index: Int, temperature: Double, rpm: Double) {
@@ -821,7 +826,7 @@ final class CoolingModel: ObservableObject {
             FanCurve.Point(temperature: Double(saved[$0]), rpm: Double(saved[$0 + 1]))
         }
         if let stored = try? FanCurve(points), (try? stored.validate(hardware: bounds)) != nil { showCurve(stored) }
-        else { showCurve(.standard(for: bounds)) }
+        else { showCurve(CurvePreset.system.curve(for: bounds)) }
     }
     func refresh() {
         heartbeat()
@@ -1212,6 +1217,9 @@ enum SettingsPage: String, CaseIterable {
 struct SettingsView: View {
     @ObservedObject var model: CoolingModel
     let page: SettingsPage
+    /// Whether Exact Values is open. An object rather than `@State`, whose macro plugin plain swiftc can't load.
+    @StateObject private var curveValues = Disclosure()
+    final class Disclosure: ObservableObject { @Published var expanded = false }
     var body: some View {
         Form {
             switch page {
@@ -1294,25 +1302,33 @@ struct SettingsView: View {
     @ViewBuilder private var fans: some View {
         Section {
             if let curve = model.curve, let bounds = model.bounds { CurveEditor(model: model, curve: curve, bounds: bounds, height: 160) }
-            HStack {
-                Text("Point").frame(maxWidth: .infinity, alignment: .leading)
-                Text("Temperature").frame(width: 92, alignment: .trailing)
-                Text("Speed").frame(width: 110, alignment: .trailing)
-            }
-            .font(.caption).foregroundStyle(.secondary)
-            ForEach(0..<FanCurve.pointCount, id: \.self) { index in
+            // Collapsed until wanted: dragging on the chart covers most edits.
+            DisclosureGroup(isExpanded: $curveValues.expanded) {
                 HStack {
-                    Text("\(index + 1)").monospacedDigit().frame(maxWidth: .infinity, alignment: .leading)
-                    unitField($model.curveTemperatureTexts[index], unit: "°C", width: 50).frame(width: 92, alignment: .trailing)
-                    unitField($model.curveRPMTexts[index], unit: "RPM", width: 64).frame(width: 110, alignment: .trailing)
+                    Text("Point").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Temperature").frame(width: 92, alignment: .trailing)
+                    Text("Speed").frame(width: 110, alignment: .trailing)
                 }
+                .font(.caption).foregroundStyle(.secondary)
+                ForEach(0..<FanCurve.pointCount, id: \.self) { index in
+                    HStack {
+                        Text("\(index + 1)").monospacedDigit().frame(maxWidth: .infinity, alignment: .leading)
+                        unitField($model.curveTemperatureTexts[index], unit: "°C", width: 50).frame(width: 92, alignment: .trailing)
+                        unitField($model.curveRPMTexts[index], unit: "RPM", width: 64).frame(width: 110, alignment: .trailing)
+                    }
+                }
+            } label: {
+                // The whole row toggles, not just the arrow.
+                Button { withAnimation { curveValues.expanded.toggle() } } label: {
+                    Text("Exact Values").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
             if let error = model.curveError { warning(error) }
-            HStack { Spacer(); Button("Reset to Default") { model.resetCurve() } }
         } header: {
             Text("Fan Curve")
         } footer: {
-            footer("Follows the hotter of CPU and GPU. Never runs fans slower than macOS or the safe minimum (dashed line), and goes to full speed if your Mac gets too hot.")
+            footer("Follows the hotter of CPU and GPU. Never runs fans slower than macOS or the safe minimum (dashed line), and goes to full speed if your Mac gets too hot. System leaves cooling to macOS and adds only the safe minimum; Balanced starts earlier; Performance runs fans hardest for the lowest temperatures.")
         }
         .disabled(model.bounds == nil)
         Section {
@@ -1531,33 +1547,62 @@ struct CurveEditor: View {
     }
     private func label(_ item: FanCurve.Point) -> String { "\(Int(item.temperature))°C · \(Int(item.rpm).formatted()) RPM" }
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .top, spacing: 4) {
-                VStack(alignment: .trailing) {
-                    Text(HistoryView.rpm(bounds.maximum))
+        HStack(alignment: .top, spacing: 6) {
+            VStack(spacing: 4) {
+                graph.frame(height: height)
+                temperatureAxis
+                HStack {
+                    Text(dragging.map { label(curve.points[$0]) } ?? "Drag points to edit")
+                        .foregroundStyle(dragging == nil ? .secondary : .primary)
                     Spacer()
-                    Text(HistoryView.rpm(bounds.minimum))
+                    Picker("Preset", selection: Binding(get: { model.curvePreset }, set: { preset in
+                        guard let preset else { return }
+                        model.applyCurvePreset(preset)
+                        model.heartbeat()  // Send the new curve now rather than at the next second.
+                    })) {
+                        ForEach(CurvePreset.allCases, id: \.self) { preset in
+                            Text(preset == .system ? "System (Default)" : preset.name).tag(CurvePreset?.some(preset))
+                        }
+                        if model.curvePreset == nil { Divider(); Text("Custom").tag(CurvePreset?.none) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
                 }
-                .frame(width: 28, alignment: .trailing)
-                graph
+                .padding(.top, 2)
             }
-            .frame(height: height)
-            HStack {
-                ForEach(Array(stride(from: low, through: high, by: 10)), id: \.self) { degrees in
-                    if degrees > low { Spacer(minLength: 0) }
-                    Text(degrees == high ? "\(Int(degrees))° max" : "\(Int(degrees))°")
-                }
-            }
-            .padding(.leading, 32)
-            HStack {
-                Spacer(minLength: 32)
-                Text(dragging.map { label(curve.points[$0]) } ?? "Drag a point to change the curve")
-                Spacer()
-            }
-            .foregroundStyle(dragging == nil ? .secondary : .primary)
+            speedAxis.frame(width: 28, height: height)
         }
         .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
+    }
+    /// Degrees under each vertical grid line, every 10°C.
+    private var temperatureAxis: some View {
+        GeometryReader { geometry in
+            ForEach(Array(stride(from: low, through: high, by: 10)), id: \.self) { degrees in
+                let x = point(degrees, bounds.minimum, in: geometry.size).x
+                // The first label starts at the edge rather than hanging off it; the others sit centered on their line.
+                Text(degrees == high ? "\(Int(degrees))° max" : "\(Int(degrees))°").fixedSize()
+                    .frame(width: 60, alignment: degrees == low ? .leading : .center)
+                    .position(x: degrees == low ? x + 30 : x, y: geometry.size.height / 2)
+            }
+        }
+        .frame(height: 14)
+    }
+    /// Fan range on the right, level with the top and bottom grid lines.
+    private var speedAxis: some View {
+        GeometryReader { geometry in
+            Text(HistoryView.rpm(bounds.maximum)).fixedSize()
+                .frame(width: geometry.size.width, alignment: .leading).position(x: geometry.size.width / 2, y: 0)
+            Text(HistoryView.rpm(bounds.minimum)).fixedSize()
+                .frame(width: geometry.size.width, alignment: .leading)
+                .position(x: geometry.size.width / 2, y: geometry.size.height)
+        }
+    }
+    /// Where a point's value goes: above and left of it, which a rising curve leaves clear, or just left of it when
+    /// the point is too close to the top. Kept inside the chart sideways.
+    private func valuePosition(_ at: CGPoint, in size: CGSize) -> CGPoint {
+        let halfWidth: CGFloat = 17
+        let spot = at.y < 30 ? CGPoint(x: at.x - 28, y: max(at.y, 11)) : CGPoint(x: at.x - 18, y: at.y - 18)
+        return CGPoint(x: min(max(spot.x, halfWidth), size.width - halfWidth), y: spot.y)
     }
     private var graph: some View {
         GeometryReader { geometry in
@@ -1622,6 +1667,20 @@ struct CurveEditor: View {
             Circle().fill(Color.orange).frame(width: 6, height: 6)
                 .position(point(now, curve.rpm(at: now), in: size))
                 .accessibilityHidden(true)
+        }
+        ForEach(curve.points.indices, id: \.self) { index in
+            let item = curve.points[index]
+            VStack(spacing: 0) {
+                Text("\(Int(item.temperature))°")
+                Text(Int(item.rpm).formatted())
+            }
+            .font(.caption2.weight(dragging == index ? .semibold : .regular)).monospacedDigit()
+            .foregroundStyle(dragging == index ? .primary : .secondary)
+            .padding(.horizontal, 2)
+            .background(Color(nsColor: .windowBackgroundColor).opacity(0.75), in: RoundedRectangle(cornerRadius: 3))
+            .fixedSize()
+            .position(valuePosition(point(item.temperature, item.rpm, in: size), in: size))
+            .accessibilityHidden(true)
         }
         ForEach(curve.points.indices, id: \.self) { index in
             let item = curve.points[index]

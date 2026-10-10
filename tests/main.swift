@@ -151,9 +151,14 @@ for bad in [[(50.0, 2000.0), (50, 3000), (70, 4000), (78, 5000)], [(50, 3000), (
             [(50, 2000), (60, 3000), (70, 4000)], [(50, .nan), (60, 3000), (70, 4000), (78, 5000)]] {
     rejects("Malformed curve \(bad)") { _ = try FanCurve(points(bad)) }
 }
-let standard = FanCurve.standard(for: hardware)
-try standard.validate(hardware: hardware)
-check(standard.points.first!.rpm == 1500 && standard.points.last!.rpm == 5500, "Default curve spans the hardware range")
+let balanced = CurvePreset.balanced.curve(for: hardware)
+check(balanced.points.first!.rpm == 1500 && balanced.points.last!.rpm == 5500, "Balanced curve spans the hardware range")
+check(CurvePreset.system.curve(for: hardware).points.allSatisfy { $0.rpm == SafeMinimum.rpm(at: $0.temperature, hardware: hardware) },
+      "System curve sits on the safe minimum, leaving the fans to macOS until the floor asks for more")
+check([40.0, 55, 65, 70, 75, 79].allSatisfy { degrees in
+    let speeds = [CurvePreset.system, .balanced, .performance].map { $0.curve(for: hardware).rpm(at: degrees) }
+    return speeds[0] <= speeds[1] && speeds[1] <= speeds[2]
+}, "Presets cool more from System to Balanced to Performance")
 try check(try CoolingTarget(encoded: CoolingTarget.curve(curve).encoded) == .curve(curve), "Curve target round trip")
 check(CoolingTarget.curve(curve).encoded.utf8.count <= 64, "Curve target fits the control file")
 rejects("Curve target with missing speed") { _ = try CoolingTarget(encoded: "curve 50 2000 60 3000 70 4000 78") }
@@ -165,7 +170,7 @@ check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious, hardware: hardwar
 check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum with a hot battery")
 check(CoolingPolicy.curveSpeed(curve, hotSSD, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum with a hot SSD")
 let oddHardware = try HardwareBounds(ranges: [(1217, 5779)])
-let oddCurve = FanCurve.standard(for: oddHardware)
+let oddCurve = CurvePreset.balanced.curve(for: oddHardware)
 let oddSpeeds = [30.0, 55, 60, 79].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal, hardware: oddHardware) }
 check(oddSpeeds.allSatisfy { $0 >= oddHardware.minimum && $0 <= oddHardware.maximum },
       "Rounding never takes the curve outside a hardware range that isn't a multiple of 50")
@@ -173,8 +178,10 @@ check([50.0, 65, 72, 75, 78, 79].map { SafeMinimum.rpm(at: $0, hardware: hardwar
       "Safe minimum rises from the fans' minimum at 65°C to half their range at 78°C")
 check(SafeMinimum.rpm(at: 50, hardware: oddHardware) == oddHardware.minimum, "Safe minimum starts at the fans' own minimum")
 for odd in [oddHardware, hardware] {
-    try FanCurve.standard(for: odd).validate(hardware: odd)
-    checks += 1
+    for preset in CurvePreset.allCases {
+        try preset.curve(for: odd).validate(hardware: odd)
+        checks += 1
+    }
 }
 rejects("Curve point below the safe minimum") {
     try FanCurve(points([(50, 2000), (60, 3000), (72, 2400), (78, 5000)])).validate(hardware: hardware)
