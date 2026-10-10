@@ -38,6 +38,46 @@ struct Temperatures {
     }
 }
 
+/// Apple silicon CPU/GPU temperature keys per chip generation. The same key can mean something else on another
+/// generation, so only the running chip's keys are probed; an unknown (newer) chip probes every known key.
+/// Reference: https://github.com/exelban/stats/blob/master/Modules/Sensors/values.swift
+enum SensorKeys {
+    enum Generation: Int, CaseIterable { case m1 = 1, m2, m3, m4, m5 }
+    /// "Apple M3 Pro" → .m3; nil for a chip this table doesn't know.
+    static func generation(brand: String) -> Generation? {
+        brand.split(separator: " ").lazy.compactMap { word -> Generation? in
+            guard word.hasPrefix("M"), let number = Int(word.dropFirst()) else { return nil }
+            return Generation(rawValue: number)
+        }.first
+    }
+    static func cpu(_ generation: Generation?) -> [String] {
+        guard let generation else { return unique(Generation.allCases.flatMap(cpu)) }
+        switch generation {
+        case .m1: return ["Tp09", "Tp0T", "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b"]
+        case .m2: return ["Tp1h", "Tp1t", "Tp1p", "Tp1l", "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f", "Tp0j"]
+        case .m3: return ["Te05", "Te0L", "Te0P", "Te0S", "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E",
+                          "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E"]
+        case .m4: return ["Te05", "Te0S", "Te09", "Te0H", "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b", "Tp0e"]
+        case .m5: return ["Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K", "Tp0O", "Tp0R", "Tp0U", "Tp0X",
+                          "Tp0a", "Tp0d", "Tp0g", "Tp0j", "Tp0m", "Tp0p", "Tp0u", "Tp0y"]
+        }
+    }
+    static func gpu(_ generation: Generation?) -> [String] {
+        guard let generation else { return unique(Generation.allCases.flatMap(gpu)) }
+        switch generation {
+        case .m1: return ["Tg05", "Tg0D", "Tg0L", "Tg0T"]
+        case .m2: return ["Tg0f", "Tg0j"]
+        case .m3: return ["Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A"]
+        case .m4: return ["Tg0G", "Tg0H", "Tg1U", "Tg1k", "Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k"]
+        case .m5: return ["Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g"]
+        }
+    }
+    private static func unique(_ keys: [String]) -> [String] {
+        var seen = Set<String>()
+        return keys.filter { seen.insert($0).inserted }
+    }
+}
+
 /// Power draw in watts. Display only.
 struct PowerReadings {
     /// Whole-system draw.
@@ -129,6 +169,16 @@ enum TemperatureReading: String, CaseIterable {
     }
 }
 
+extension TemperatureReading {
+    /// What a Mac can show: a fanless Mac has no fan speed.
+    static func available(fanless: Bool) -> [TemperatureReading] { fanless ? allCases.filter { $0 != .fan } : allCases }
+    /// The chosen readings this Mac can show, falling back to the hottest temperature so the menu bar is never empty.
+    static func shown(_ chosen: [TemperatureReading], fanless: Bool) -> [TemperatureReading] {
+        let shown = chosen.filter(available(fanless: fanless).contains)
+        return shown.isEmpty ? [.hottest] : shown
+    }
+}
+
 /// Stacked menu bar readings: two to a column, read top to bottom, then left to right.
 enum MenuBarLayout {
     static func columns(_ readings: [TemperatureReading]) -> [[TemperatureReading]] {
@@ -187,6 +237,7 @@ enum CoolingTarget: Equatable {
     case manual(rpm: Double)
     case maximum
     case curve(FanCurve)
+    var isManual: Bool { if case .manual = self { return true } else { return false } }
     var encoded: String {
         switch self {
         case .manual(let rpm): return "manual \(Int(rpm.rounded()))\n"
@@ -273,7 +324,9 @@ struct CoolingPolicy {
     static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, thermal: ThermalLevel) -> Double {
         guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
               temperatures.battery.map({ $0 < 45 }) ?? true else { return .infinity }
-        return (curve.rpm(at: temperatures.highest) / 50).rounded() * 50
+        // Rounding must not leave the curve's range, which is within the fans' hardware range.
+        let rounded = (curve.rpm(at: temperatures.highest) / 50).rounded() * 50
+        return min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm)
     }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
         guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,

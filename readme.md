@@ -30,6 +30,8 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 
 Requires an Apple silicon Mac, macOS 13+, and Xcode Command Line Tools.
 
+Works on M1 through M5 chips, using each generation's own sensor keys; a newer chip probes every known key. Macs with two fans (14" and 16" MacBook Pro) are controlled together within the speed range both fans support. Fanless Macs, such as the MacBook Air, show temperatures only. `baadgir status` prints the chip, fans and sensor keys it found.
+
 ```sh
 ./test.sh
 ./build.sh --install   # builds, installs the root-owned fan-control helper (asks for your password), replaces /Applications/Baadgir.app, and opens it

@@ -15,6 +15,20 @@ struct Fan {
     let modeKey: String
     let mode: UInt8
 }
+struct SMCFailure: Error, CustomStringConvertible {
+    let key: String, command: UInt8, kernel: kern_return_t, smc: UInt8
+    var description: String { "SMC \(key) command \(command) rejected (IOKit \(kernel), SMC \(smc))" }
+    /// kSMCKeyNotFound: this Mac doesn't have the key, as opposed to a failed read.
+    var keyNotFound: Bool { kernel == KERN_SUCCESS && smc == 0x84 }
+}
+/// The chip's marketing name, such as "Apple M3 Pro".
+func chipName() -> String {
+    var size = 0
+    guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+    var bytes = [CChar](repeating: 0, count: size)
+    guard sysctlbyname("machdep.cpu.brand_string", &bytes, &size, nil, 0) == 0 else { return "" }
+    return String(cString: bytes)
+}
 final class SMC {
     var connection: io_connect_t = 0
     init() throws {
@@ -41,7 +55,7 @@ final class SMC {
             }
         }
         guard result == KERN_SUCCESS, count == 80, output[40] == 0 else {
-            throw Failure("SMC \(key) command \(command) rejected (IOKit \(result), SMC \(output[40]))")
+            throw SMCFailure(key: key, command: command, kernel: result, smc: output[40])
         }
         return output
     }
@@ -59,30 +73,22 @@ final class SMC {
         guard value >= 0 else { throw Failure("Invalid value for \(key)") }
         return Float(value)
     }
-    private var cpuKeys: [String] = []
-    private var gpuKeys: [String] = []
+    private(set) var cpuKeys: [String] = []
+    private(set) var gpuKeys: [String] = []
     private var batteryKeys: [String] = []
     private var ssdKeys: [String] = []
     private var discoveredTemperatures = false
     func temperatures() throws -> Temperatures {
         if !discoveredTemperatures {
-            // Known Apple silicon CPU/GPU sensor IDs, including M5.
-            // Reference: https://github.com/exelban/stats/blob/master/Modules/Sensors/values.swift
-            let cpuCandidates = ["Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K",
-                "Tp0O", "Tp0R", "Tp0U", "Tp0X", "Tp0a", "Tp0d", "Tp0g", "Tp0j",
-                "Tp0m", "Tp0p", "Tp0u", "Tp0y", "Tp01", "Tp05", "Tp09", "Tp0D",
-                "Tp0H", "Tp0L", "Tp0P", "Tp0T", "Tp0b", "Tp0V", "Tp0Y", "Tp0e",
-                "Te05", "Te0S", "Te09", "Te0H"]
-            let gpuCandidates = ["Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g",
-                "Tg05", "Tg0D", "Tg0L", "Tg0G", "Tg0H", "Tg0K", "Tg0e", "Tg0k", "Tg1U", "Tg1k"]
+            let generation = SensorKeys.generation(brand: chipName())
             func available(_ keys: [String]) -> [String] {
                 keys.filter { key in
                     guard let value = try? number(key) else { return false }
                     return value > 0 && value <= 130
                 }
             }
-            cpuKeys = available(cpuCandidates)
-            gpuKeys = available(gpuCandidates)
+            cpuKeys = available(SensorKeys.cpu(generation))
+            gpuKeys = available(SensorKeys.gpu(generation))
             batteryKeys = available(["TB0T", "TB1T", "TB2T"])
             // SSD (NAND) sensors; display only.
             ssdKeys = available(["TH0x", "TH0A", "TH0B", "TH0a", "TH0b"])
@@ -102,9 +108,12 @@ final class SMC {
         let system = Double(try number("PSTR"))
         return try PowerReadings(system: system, adapter: (try? number("PDTR")).map(Double.init))
     }
+    /// Empty on a fanless Mac, such as a MacBook Air, which has no fan count or a count of zero.
     func fans() throws -> [Fan] {
-        let count = try number("FNum")
-        guard count >= 1, count <= 8, count.rounded() == count else { throw Failure("No supported fans") }
+        let count: Float
+        do { count = try number("FNum") }
+        catch let error as SMCFailure where error.keyNotFound { return [] }
+        guard count <= 8, count.rounded() == count else { throw Failure("Unexpected fan count") }
         return try (0..<Int(count)).map { index in
             let prefix = "F\(index)"
             let modeKey = (try? read(prefix + "md")) != nil ? prefix + "md" : prefix + "Md"
@@ -211,13 +220,15 @@ func acquireLock() throws -> Int32 {
     return lock
 }
 /// Reads the app's requested target and the control file's modification time.
-func readControl(in folder: Int32) throws -> (target: CoolingTarget, modified: Double) {
+func readControl(in folder: Int32, owner: uid_t) throws -> (target: CoolingTarget, modified: Double) {
     // Non-blocking so a FIFO in place of the file cannot stall the helper while fans are manual.
     let file = openat(folder, "control", O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     guard file >= 0 else { throw Failure("Cooling controls are unavailable; returning to automatic cooling") }
     defer { close(file) }
     var info = stat()
-    guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 64 else {
+    // The app's own single-link file only: a hard link could otherwise point root at a file the user cannot read.
+    guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 64,
+          info.st_uid == owner, info.st_nlink == 1 else {
         throw Failure("Cooling controls are invalid")
     }
     var buffer = [UInt8](repeating: 0, count: 64)
@@ -230,7 +241,8 @@ func coolingSession(parent: pid_t, directory: String) throws {
     try requireRootHelper()
     let lock = try acquireLock()
     defer { close(lock) }
-    let folder = try openSessionDirectory(directory, owner: try processOwner(parent))
+    let owner = try processOwner(parent)
+    let folder = try openSessionDirectory(directory, owner: owner)
     defer { close(folder) }
     func cancelled() -> Bool {
         var info = stat()
@@ -248,7 +260,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
     let bounds = try HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
     var heartbeat = Heartbeat()
     func requestedTarget() throws -> CoolingTarget {
-        let (target, modified) = try readControl(in: folder)
+        let (target, modified) = try readControl(in: folder, owner: owner)
         guard heartbeat.isFresh(stamp: modified, now: ProcessInfo.processInfo.systemUptime) else {
             throw Failure("Baadgir stopped responding; returning to automatic cooling")
         }
@@ -261,10 +273,11 @@ func coolingSession(parent: pid_t, directory: String) throws {
         return target
     }
     // The first target must also be recent by wall clock; later checks use the monotonic heartbeat.
-    guard abs(Date().timeIntervalSince1970 - (try readControl(in: folder)).modified) <= CoolingPolicy.heartbeatTimeout else {
+    guard abs(Date().timeIntervalSince1970 - (try readControl(in: folder, owner: owner)).modified) <= CoolingPolicy.heartbeatTimeout else {
         throw Failure("Cooling controls are stale")
     }
-    switch try requestedTarget() {
+    var previousTarget = try requestedTarget()
+    switch previousTarget {
     case .manual: try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: true)
     case .curve: _ = try smc.temperatures()
     case .maximum: break
@@ -309,12 +322,16 @@ func coolingSession(parent: pid_t, directory: String) throws {
             if previous.duration(to: now) > .seconds(3) || cancelled() { break }
             previous = now
             let target = try requestedTarget()
+            let wasManual = previousTarget.isManual
+            previousTarget = target
             let wanted: [Float]?
             switch target {
             case .maximum:
                 wanted = fans.map(\.maximum)
             case .manual(let rpm):
-                try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: false)
+                // Switching into Manual from Max or Curve must meet the same start limit as a new session.
+                try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(),
+                                                      starting: !wasManual)
                 wanted = fans.map { _ in Float(rpm) }
             case .curve(let curve):
                 if !curveController.engaged, applied != nil {
@@ -427,6 +444,10 @@ func restoreAutomatic() throws {
 
 final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
+    /// No fans at all, such as a MacBook Air: Baadgir only shows temperatures. False until the first fan read.
+    @Published private(set) var fanless = false {
+        didSet { if fanless != oldValue { onMenuBarLayoutChange?(); onHotKeyChange?() } }
+    }
     @Published var temperatures: Temperatures?
     @Published var power: PowerReadings?
     @Published var sensorError = "Reading sensors…"
@@ -455,10 +476,12 @@ final class CoolingModel: ObservableObject {
     @Published var showsMenuBarIcon = UserDefaults.standard.object(forKey: "showsMenuBarIcon") as? Bool ?? true {
         didSet { defaults.set(showsMenuBarIcon, forKey: "showsMenuBarIcon"); onMenuBarLayoutChange?() }
     }
+    /// The chosen readings this Mac can show.
+    var shownMenuBarReadings: [TemperatureReading] { TemperatureReading.shown(menuBarReadings, fanless: fanless) }
     var onMenuBarLayoutChange: (() -> Void)?
     func toggleMenuBar(_ reading: TemperatureReading) {
         if menuBarReadings.contains(reading) {
-            guard menuBarReadings.count > 1 else { return }
+            guard shownMenuBarReadings.contains(where: { $0 != reading }) else { return }
             menuBarReadings.removeAll { $0 == reading }
         } else {
             menuBarReadings = TemperatureReading.allCases.filter { $0 == reading || menuBarReadings.contains($0) }
@@ -532,7 +555,7 @@ final class CoolingModel: ObservableObject {
     private func applyRules() {
         let source = currentPowerSource()
         defer { lastPowerSource = source }
-        guard pending == nil, let mode = rules.mode(from: lastPowerSource, to: source, current: sessionRunning ? mode : .auto)
+        guard !fanless, pending == nil, let mode = rules.mode(from: lastPowerSource, to: source, current: sessionRunning ? mode : .auto)
         else { return }
         select(mode)
     }
@@ -625,6 +648,7 @@ final class CoolingModel: ObservableObject {
     }
     var status: String {
         if let pending { return pending }
+        if fanless { return "No fans · temperatures only" }
         if externallyControlled { return "A fan is stuck in manual mode" }
         guard sessionRunning else { return "Automatic cooling" }
         if mode == .maximum { return "Maximum cooling" }
@@ -678,22 +702,28 @@ final class CoolingModel: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             var fans: [Fan] = []
+            var fanless: Bool?  // Nil when the fans could not be read.
             var temperatures: Temperatures?
             var power: PowerReadings?
-            var errorMessage = ""
+            var errors: [String] = []
             do {
                 if self.smc == nil { self.smc = try SMC() }
-                fans = try self.smc!.fans()
-                do { temperatures = try self.smc!.temperatures() }
-                catch { errorMessage = String(describing: error) }
-                power = try? self.smc!.power()
+                let smc = self.smc!
+                // Fans and temperatures are read separately, so a Mac without fans still shows temperatures.
+                do { fans = try smc.fans(); fanless = fans.isEmpty }
+                catch { errors.append(String(describing: error)) }
+                do { temperatures = try smc.temperatures() }
+                catch { errors.append(String(describing: error)) }
+                power = try? smc.power()
+                if fanless == nil && temperatures == nil { self.smc = nil }  // Reconnect on the next read.
             } catch {
-                self.smc = nil
-                errorMessage = String(describing: error)
+                errors.append(String(describing: error))
             }
+            let errorMessage = errors.joined(separator: "\n")
             DispatchQueue.main.async {
                 self.reading = false
                 self.fans = fans; self.temperatures = temperatures; self.power = power; self.sensorError = errorMessage
+                if let fanless { self.fanless = fanless }
                 self.hasRead = true
                 self.history.append(HistorySample(cpu: temperatures?.cpu, gpu: temperatures?.gpu, fan: self.fanSpeed))
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
@@ -718,6 +748,9 @@ final class CoolingModel: ObservableObject {
 
     func select(_ newMode: FanMode) {
         message = nil
+        if fanless, newMode != .auto {
+            message = "This Mac has no fans, so Baadgir only shows temperatures."; onUpdate?(); return
+        }
         if let reason = rules.blocker(for: newMode, on: currentPowerSource()) { message = reason; onUpdate?(); return }
         switch newMode {
         case .auto:
@@ -899,7 +932,9 @@ struct ControlsView: View {
                 }
             }
             .font(.caption)
-            if model.showsHistory { HistoryView(samples: model.history.elements, fanMaximum: model.bounds?.maximum) }
+            if model.showsHistory {
+                HistoryView(samples: model.history.elements, fanMaximum: model.bounds?.maximum, showsFan: !model.fanless)
+            }
             ForEach(model.fans, id: \.index) { fan in
                 HStack {
                     Text("Fan \(fan.index + 1)")
@@ -913,21 +948,26 @@ struct ControlsView: View {
                 Text(model.sensorError).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             }
             Divider()
-            Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.select($0) })) {
-                Text("Auto").tag(FanMode.auto)
-                Text("Curve").tag(FanMode.curve)
-                Text("Manual").tag(FanMode.manual)
-                Text("Max").tag(FanMode.maximum)
+            if model.fanless {
+                Text("This Mac has no fans. macOS cools it by slowing the chip down when it gets hot.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.select($0) })) {
+                    Text("Auto").tag(FanMode.auto)
+                    Text("Curve").tag(FanMode.curve)
+                    Text("Manual").tag(FanMode.manual)
+                    Text("Max").tag(FanMode.maximum)
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                .disabled(model.pending != nil || model.fans.isEmpty)
+                if model.showsManualControls { manualControls }
+                if model.sessionRunning && model.mode == .curve, let speed = model.curveSpeedNow {
+                    Text(speed.isInfinite ? "Curve wants maximum cooling"
+                                          : "Curve wants \(Int(speed).formatted()) RPM at \(Int(model.temperatures?.highest ?? 0))°C")
+                        .font(.caption).monospacedDigit()
+                }
+                Text(explanation).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            .pickerStyle(.segmented).labelsHidden()
-            .disabled(model.pending != nil || model.fans.isEmpty)
-            if model.showsManualControls { manualControls }
-            if model.sessionRunning && model.mode == .curve, let speed = model.curveSpeedNow {
-                Text(speed.isInfinite ? "Curve wants maximum cooling"
-                                      : "Curve wants \(Int(speed).formatted()) RPM at \(Int(model.temperatures?.highest ?? 0))°C")
-                    .font(.caption).monospacedDigit()
-            }
-            Text(explanation).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1012,9 +1052,11 @@ struct SettingsView: View {
                         Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
-                Toggle("Notify when fans return to Auto on their own", isOn: $model.notifiesOnReturn)
-                Toggle("⌃⌥M switches between Max and Auto", isOn: $model.usesMaxHotKey)
-                Toggle("Allow Shortcuts, baadgir:// links and the command line to change fan mode", isOn: $model.allowsLinks)
+                if !model.fanless {
+                    Toggle("Notify when fans return to Auto on their own", isOn: $model.notifiesOnReturn)
+                    Toggle("⌃⌥M switches between Max and Auto", isOn: $model.usesMaxHotKey)
+                    Toggle("Allow Shortcuts, baadgir:// links and the command line to change fan mode", isOn: $model.allowsLinks)
+                }
                 if let error = model.hotKeyError {
                     Text(error).font(.caption).foregroundStyle(.orange)
                 }
@@ -1030,12 +1072,12 @@ struct SettingsView: View {
                     Text("Stacked").tag(true)
                 }
                 .pickerStyle(.segmented)
-                .disabled(model.menuBarReadings.count < 2)  // One reading has nothing to stack.
-                Toggle("Show the fan icon", isOn: $model.showsMenuBarIcon)
-                ForEach(TemperatureReading.allCases, id: \.self) { reading in
-                    Toggle(reading.title, isOn: Binding(get: { model.menuBarReadings.contains(reading) },
+                .disabled(model.shownMenuBarReadings.count < 2)  // One reading has nothing to stack.
+                Toggle(model.fanless ? "Show the thermometer icon" : "Show the fan icon", isOn: $model.showsMenuBarIcon)
+                ForEach(TemperatureReading.available(fanless: model.fanless), id: \.self) { reading in
+                    Toggle(reading.title, isOn: Binding(get: { model.shownMenuBarReadings.contains(reading) },
                                                         set: { _ in model.toggleMenuBar(reading) }))
-                        .disabled(model.menuBarReadings == [reading])  // At least one reading stays on.
+                        .disabled(model.shownMenuBarReadings == [reading])  // At least one reading stays on.
                 }
                 Toggle("Color temperatures green, yellow and red", isOn: $model.colorsTemperatures)
                 Toggle("Show the last 10 minutes in the popover", isOn: $model.showsHistory)
@@ -1045,64 +1087,67 @@ struct SettingsView: View {
                 Text("Yellow and red start at 70°C and 85°C for CPU and GPU, 35°C and 40°C for battery, and 55°C and 70°C for SSD. High thermal pressure also turns readings yellow or red.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            Section {
-                TextField("Minimum RPM", text: $model.minimumText)
-                TextField("Maximum RPM", text: $model.maximumText)
-                if model.bounds != nil && !model.rangeIsValid {
-                    Text("Enter a minimum below the maximum, within the hardware range.")
-                        .font(.caption).foregroundStyle(.orange)
-                }
-            } header: {
-                Text("Manual Speed Limits")
-            } footer: {
-                Text(model.bounds.map { "Sets the Manual slider's range. Your fan supports \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
-                     ?? "Reading fan limits…")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            .disabled(model.bounds == nil)
-            Section {
-                ForEach(0..<FanCurve.pointCount, id: \.self) { index in
-                    HStack {
-                        Text("Point \(index + 1)")
-                        Spacer()
-                        TextField("°C", text: $model.curveTemperatureTexts[index]).frame(width: 50)
-                        Text("°C").foregroundStyle(.secondary)
-                        TextField("RPM", text: $model.curveRPMTexts[index]).frame(width: 64)
-                        Text("RPM").foregroundStyle(.secondary)
-                    }
-                    .labelsHidden().multilineTextAlignment(.trailing)
-                }
-                if let error = model.curveError {
-                    Text(error).font(.caption).foregroundStyle(.orange)
-                }
-                if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
-                HStack { Spacer(); Button("Reset to Default") { model.resetCurve() } }
-            } header: {
-                Text("Fan Curve")
-            } footer: {
-                Text("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery or high thermal pressure, fans run at maximum.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            .disabled(model.bounds == nil)
-            Section {
-                Toggle("On battery, return to Auto and stay there", isOn: $model.rules.autoOnBattery)
-                Picker("When plugged in", selection: $model.rules.onAdapter) {
-                    Text("Do nothing").tag(FanMode?.none)
-                    Text("Switch to Curve").tag(FanMode?.some(.curve))
-                    Text("Switch to Max").tag(FanMode?.some(.maximum))
-                }
-            } header: {
-                Text("Rules")
-            } footer: {
-                Text("The plugged-in rule runs when you connect power and when Baadgir starts while plugged in, only if fans are on Auto. Starting a mode may ask for your administrator password.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            .disabled(model.bounds == nil)
+            if !model.fanless { fanSections }
         }
         .formStyle(.grouped)
         // Fixed height so the window fits small screens; the form scrolls.
-        .frame(width: 440, height: 680)
+        .frame(width: 440, height: model.fanless ? 420 : 680)
         .onAppear { model.refreshLoginItemStatus() }
+    }
+    @ViewBuilder private var fanSections: some View {
+        Section {
+            TextField("Minimum RPM", text: $model.minimumText)
+            TextField("Maximum RPM", text: $model.maximumText)
+            if model.bounds != nil && !model.rangeIsValid {
+                Text("Enter a minimum below the maximum, within the hardware range.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        } header: {
+            Text("Manual Speed Limits")
+        } footer: {
+            Text(model.bounds.map { "Sets the Manual slider's range. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
+                 ?? "Reading fan limits…")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(model.bounds == nil)
+        Section {
+            ForEach(0..<FanCurve.pointCount, id: \.self) { index in
+                HStack {
+                    Text("Point \(index + 1)")
+                    Spacer()
+                    TextField("°C", text: $model.curveTemperatureTexts[index]).frame(width: 50)
+                    Text("°C").foregroundStyle(.secondary)
+                    TextField("RPM", text: $model.curveRPMTexts[index]).frame(width: 64)
+                    Text("RPM").foregroundStyle(.secondary)
+                }
+                .labelsHidden().multilineTextAlignment(.trailing)
+            }
+            if let error = model.curveError {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+            if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
+            HStack { Spacer(); Button("Reset to Default") { model.resetCurve() } }
+        } header: {
+            Text("Fan Curve")
+        } footer: {
+            Text("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery or high thermal pressure, fans run at maximum.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(model.bounds == nil)
+        Section {
+            Toggle("On battery, return to Auto and stay there", isOn: $model.rules.autoOnBattery)
+            Picker("When plugged in", selection: $model.rules.onAdapter) {
+                Text("Do nothing").tag(FanMode?.none)
+                Text("Switch to Curve").tag(FanMode?.some(.curve))
+                Text("Switch to Max").tag(FanMode?.some(.maximum))
+            }
+        } header: {
+            Text("Rules")
+        } footer: {
+            Text("The plugged-in rule runs when you connect power and when Baadgir starts while plugged in, only if fans are on Auto. Starting a mode may ask for your administrator password.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(model.bounds == nil)
     }
 }
 
@@ -1132,6 +1177,7 @@ struct Sparkline: Shape {
 struct HistoryView: View {
     let samples: [HistorySample]
     let fanMaximum: Double?
+    var showsFan = true
     private let capacity = 600
     var body: some View {
         let temperatures = samples.flatMap { [$0.cpu, $0.gpu] }.compactMap { $0 }
@@ -1151,19 +1197,21 @@ struct HistoryView: View {
             }
             .frame(height: 36)
             .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
-            HStack {
-                legend("Fan", .teal)
-                Spacer()
-                if let fanPeak { Text("peak \(Int(fanPeak.rounded()).formatted()) RPM").foregroundStyle(.secondary) }
+            if showsFan {
+                HStack {
+                    legend("Fan", .teal)
+                    Spacer()
+                    if let fanPeak { Text("peak \(Int(fanPeak.rounded()).formatted()) RPM").foregroundStyle(.secondary) }
+                }
+                .font(.caption)
+                Sparkline(values: samples.map(\.fan), range: 0...(fanMaximum ?? max(fanPeak ?? 1, 1)), capacity: capacity)
+                    .stroke(.teal, lineWidth: 1.5)
+                    .frame(height: 24)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
             }
-            .font(.caption)
-            Sparkline(values: samples.map(\.fan), range: 0...(fanMaximum ?? max(fanPeak ?? 1, 1)), capacity: capacity)
-                .stroke(.teal, lineWidth: 1.5)
-                .frame(height: 24)
-                .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Temperature and fan history for the last 10 minutes")
+        .accessibilityLabel(showsFan ? "Temperature and fan history for the last 10 minutes" : "Temperature history for the last 10 minutes")
     }
     private func legend(_ title: String, _ color: Color) -> some View {
         HStack(spacing: 3) {
@@ -1257,7 +1305,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private func updateHotKey() {
         if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
         model.hotKeyError = nil
-        guard model.usesMaxHotKey else { return }
+        guard model.usesMaxHotKey, !model.fanless else { return }
         if hotKeyHandler == nil {
             var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
@@ -1311,7 +1359,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     }
     private func refreshStatusItem() {
         guard !menuOpen else { return }
-        let wanted = model.displayedMode == .auto ? "fan" : "fan.fill"
+        let wanted = model.fanless ? "thermometer.medium" : model.displayedMode == .auto ? "fan" : "fan.fill"
         let symbolChanged = wanted != symbol
         symbol = wanted
         if layoutPending { layoutPending = false; fixStatusItemWidth() }
@@ -1322,7 +1370,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         }
         item.button?.toolTip = "Baadgir · " + model.status
     }
-    private var stacked: Bool { model.stacksMenuBarReadings && model.menuBarReadings.count > 1 }
+    private var stacked: Bool { model.stacksMenuBarReadings && model.shownMenuBarReadings.count > 1 }
     private var statusSymbol: NSImage? {
         model.showsMenuBarIcon ? NSImage(systemSymbolName: symbol, accessibilityDescription: "Baadgir") : nil
     }
@@ -1330,7 +1378,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private var titleFont: NSFont { .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
     /// One reading shows " 72°C"; several show " C 72°  G 64°" with letter prefixes. No leading space without the icon.
     private func title(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSAttributedString {
-        let readings = model.menuBarReadings
+        let readings = model.shownMenuBarReadings
         let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
         paragraph.lineBreakMode = .byClipping  // The default word wrap splits readings onto two lines.
         let base: [NSAttributedString.Key: Any] = [.font: titleFont, .paragraphStyle: paragraph]
@@ -1363,13 +1411,13 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         let letterWidth = TemperatureReading.allCases.map { width($0.letter) }.max() ?? 0
         let gap: CGFloat = 3, spacing: CGFloat = 7
         // Sized for the widest value so the item never shifts.
-        let column = letterWidth + gap + (model.menuBarReadings.map { width($0.text($0.widest, compact: true)) }.max() ?? 0)
+        let column = letterWidth + gap + (model.shownMenuBarReadings.map { width($0.text($0.widest, compact: true)) }.max() ?? 0)
         let configuration = NSImage.SymbolConfiguration(pointSize: NSFont.systemFontSize, weight: .regular)
             .applying(NSImage.SymbolConfiguration(paletteColors: [.labelColor]))
         let fan = model.showsMenuBarIcon
             ? NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(configuration) : nil
         let fanWidth = fan.map { ceil($0.size.width) + 5 } ?? 0
-        let columns = MenuBarLayout.columns(model.menuBarReadings).map { column in
+        let columns = MenuBarLayout.columns(model.shownMenuBarReadings).map { column in
             column.map { reading -> (letter: String, number: String, color: NSColor) in
                 let level = colored ? model.heatLevel(reading, value(reading)) : nil
                 return (reading.letter, reading.text(value(reading), compact: true), level.map(NSColor.heat) ?? .labelColor)
@@ -1398,7 +1446,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     }
     private func updateStackedImage() {
         item.button?.image = stackedImage(currentValue, colored: true)
-        item.button?.setAccessibilityValue(model.menuBarReadings.map { reading in
+        item.button?.setAccessibilityValue(model.shownMenuBarReadings.map { reading in
             "\(reading.title) " + (currentValue(reading).map { reading.text($0, compact: false) } ?? "unavailable")
         }.joined(separator: ", "))
     }
@@ -1445,7 +1493,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         if let power = model.power { info("Power: " + power.text) }
         menu.addItem(.separator())
         let busy = model.pending != nil || model.fans.isEmpty
-        for (title, mode) in [("Auto", FanMode.auto),
+        for (title, mode) in model.fanless ? [] : [("Auto", FanMode.auto),
                               ("Curve", .curve),
                               ("Manual · \(Int(model.selectedRPM.rounded()).formatted()) RPM", .manual),
                               ("Max", .maximum)] {
@@ -1457,7 +1505,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             }
             menu.addItem(entry)
         }
-        menu.addItem(.separator())
+        if !model.fanless { menu.addItem(.separator()) }
         let open = NSMenuItem(title: "Open Baadgir", action: #selector(togglePopover), keyEquivalent: "")
         open.target = self; menu.addItem(open)
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
@@ -1531,12 +1579,19 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
 func diagnostic() -> String {
     do {
         let smc = try SMC()
-        var lines = try smc.fans().map {
-            "Fan \($0.index): \($0.rpm) RPM, range \($0.minimum)–\($0.maximum), mode \($0.mode) (\($0.modeKey))"
-        }
+        let chip = chipName()
+        var lines = ["Chip: \(chip.isEmpty ? "unknown" : chip)"
+                     + (SensorKeys.generation(brand: chip) == nil ? " (not in the sensor table; probing every known key)" : "")]
+        do {
+            let fans = try smc.fans()
+            lines += fans.isEmpty ? ["No fans: temperatures only"] : fans.map {
+                "Fan \($0.index): \($0.rpm) RPM, range \($0.minimum)–\($0.maximum), mode \($0.mode) (\($0.modeKey))"
+            }
+        } catch { lines.append("Fan readings unavailable: \(error)") }
         do {
             let temperatures = try smc.temperatures()
             lines.append("CPU \(temperatures.cpu)°C · GPU \(temperatures.gpu)°C")
+            lines.append("Sensors: CPU \(smc.cpuKeys.joined(separator: " ")) · GPU \(smc.gpuKeys.joined(separator: " "))")
         } catch { lines.append("Temperature readings unavailable: \(error)") }
         do { lines.append("Power: " + (try smc.power()).text) }
         catch { lines.append("Power readings unavailable: \(error)") }

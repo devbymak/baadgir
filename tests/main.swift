@@ -147,6 +147,13 @@ check(CoolingPolicy.curveSpeed(curve, cool, thermal: .nominal) == 2500, "Curve f
 check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal) == .infinity, "Curve runs maximum at the stop limit")
 check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious) == .infinity, "Curve runs maximum under thermal pressure")
 check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal) == .infinity, "Curve runs maximum with a hot battery")
+let oddHardware = try HardwareBounds(ranges: [(1217, 5779)])
+let oddCurve = FanCurve.standard(for: oddHardware)
+let oddSpeeds = [30.0, 55, 60, 79].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal) }
+check(oddSpeeds.allSatisfy { $0 >= oddHardware.minimum && $0 <= oddHardware.maximum },
+      "Rounding never takes the curve outside a hardware range that isn't a multiple of 50")
+check(CoolingTarget.manual(rpm: 2000).isManual && !CoolingTarget.maximum.isManual && !CoolingTarget.curve(curve).isManual,
+      "Only a manual target counts as already in Manual, so switching from Max or Curve uses the start limit")
 var controller = CurveController()
 check(controller.targets(desired: 2500, actual: [2300], maximums: [6000], now: 0) == nil,
       "Curve leaves fans with macOS unless it clearly wants more")
@@ -211,4 +218,27 @@ FileManager.default.createFile(atPath: userFile, contents: Data())
 check(isRootOwned("/bin/sh") && !isRootOwned(userFile) && !isRootOwned("/bin") && !isRootOwned("bin/sh") &&
       !isRootOwned("/nonexistent/helper"), "Only root-owned files in root-owned folders are trusted")
 try? FileManager.default.removeItem(atPath: userFile)
+check(SensorKeys.generation(brand: "Apple M1") == .m1 && SensorKeys.generation(brand: "Apple M2 Max") == .m2 &&
+      SensorKeys.generation(brand: "Apple M3 Pro") == .m3 && SensorKeys.generation(brand: "Apple M4") == .m4 &&
+      SensorKeys.generation(brand: "Apple M5 Pro") == .m5, "Chip names map to their sensor generation")
+check(SensorKeys.generation(brand: "Apple M9") == nil && SensorKeys.generation(brand: "") == nil &&
+      SensorKeys.generation(brand: "Intel(R) Core(TM) i7") == nil, "Unknown chips have no generation")
+check(SensorKeys.Generation.allCases.allSatisfy { !SensorKeys.cpu($0).isEmpty && !SensorKeys.gpu($0).isEmpty },
+      "Every generation has CPU and GPU keys, which control requires")
+check(SensorKeys.gpu(.m3).contains("Tf14") && SensorKeys.cpu(.m3).contains("Tf04") && !SensorKeys.gpu(.m3).contains("Tg0j"),
+      "M3 uses its own Tf GPU and performance-core keys, not other generations' keys")
+check(SensorKeys.cpu(.m2).contains("Tp1h") && SensorKeys.gpu(.m2).contains("Tg0f") && SensorKeys.gpu(.m1).contains("Tg0T"),
+      "M1 and M2 include every known key")
+let allCPU = SensorKeys.cpu(nil), allGPU = SensorKeys.gpu(nil)
+check(SensorKeys.Generation.allCases.allSatisfy { Set(SensorKeys.cpu($0)).isSubset(of: allCPU) && Set(SensorKeys.gpu($0)).isSubset(of: allGPU) } &&
+      Set(allCPU).count == allCPU.count && Set(allGPU).count == allGPU.count,
+      "An unknown chip probes every known key once")
+check((SensorKeys.Generation.allCases.map(Optional.some) + [nil]).allSatisfy {
+          (SensorKeys.cpu($0) + SensorKeys.gpu($0)).allSatisfy { $0.utf8.count == 4 && $0.first == "T" } },
+      "Sensor keys are four-character temperature keys")
+check(!TemperatureReading.available(fanless: true).contains(.fan) && TemperatureReading.available(fanless: false).contains(.fan),
+      "A fanless Mac offers no fan speed reading")
+check(TemperatureReading.shown([.cpu, .fan], fanless: true) == [.cpu] && TemperatureReading.shown([.fan], fanless: true) == [.hottest] &&
+      TemperatureReading.shown([.cpu, .fan], fanless: false) == [.cpu, .fan],
+      "A fanless Mac drops fan speed from the menu bar and never shows nothing")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
