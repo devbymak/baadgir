@@ -117,7 +117,7 @@ final class SMC {
         guard count <= 8, count.rounded() == count else { throw Failure("Unexpected fan count") }
         return try (0..<Int(count)).map { index in
             let prefix = "F\(index)"
-            let modeKey = modeKey(index)
+            let modeKey = try modeKey(index)
             let mode = try number(modeKey)
             guard [Float(0), 1, 3].contains(mode) else { throw Failure("Unknown fan mode") }
             let maximum = try number(prefix + "Mx")
@@ -136,10 +136,13 @@ final class SMC {
         do { count = try number("FNum") }
         catch let error as SMCFailure where error.keyNotFound { return [] }
         guard count <= 8, count.rounded() == count else { throw Failure("Unexpected fan count") }
-        return (0..<Int(count)).map(modeKey)
+        return try (0..<Int(count)).map(modeKey)
     }
-    private func modeKey(_ index: Int) -> String {
-        (try? read("F\(index)md")) != nil ? "F\(index)md" : "F\(index)Md"
+    /// `F<n>md`, or `F<n>Md` on Macs without it. Only a missing key falls back: a failed read must not pick a key
+    /// this Mac doesn't have, which would leave that fan unrestorable.
+    private func modeKey(_ index: Int) throws -> String {
+        do { _ = try read("F\(index)md"); return "F\(index)md" }
+        catch let error as SMCFailure where error.keyNotFound { return "F\(index)Md" }
     }
     // The only writable keys are fan target and mode. No diagnostic unlocks.
     func write(_ key: String, expectedType: String, bytes: [UInt8]) throws {
@@ -479,12 +482,13 @@ func watchdog() {
     }
     // The pipe is still open, so the helper is alive but stuck, possibly holding fans at a stale speed.
     if stalled, parentIsHelper { kill(helper, SIGKILL) }
-    // The helper's lock may close a moment after the pipe, and the SMC can fail briefly; keep trying for a few seconds.
-    for _ in 0..<30 {
-        do { try restoreAutomatic(); return } catch { usleep(100_000) }
-    }
+    // Up to 30 seconds while the SMC fails; 3 while the lock stays busy.
+    let restored = AutomaticRestoration.retry(isBusy: { ($0 as? Failure)?.description == lockBusy },
+                                              delay: { usleep(100_000) }) { try restoreAutomatic() }
     // A helper stuck inside the kernel can't exit and keeps its lock; restore without it rather than leave fans manual.
-    if stalled { try? restoreAutomatic(locking: false) }
+    if !restored, stalled {
+        _ = AutomaticRestoration.retry(isBusy: { _ in false }, delay: { usleep(100_000) }) { try restoreAutomatic(locking: false) }
+    }
 }
 let lockBusy = "A cooling session is already running"
 /// Returns fans left in manual mode (for example after a crash or by another app) to Auto. Callers check they run as root.

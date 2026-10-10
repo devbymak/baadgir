@@ -536,4 +536,20 @@ struct AutomaticRestoration {
         }
         return success
     }
+    /// The watchdog's retries once the helper is gone. SMC failures can last a while, so it keeps trying for `attempts`.
+    /// The old helper closes its lock a moment after the pipe, so a lock still busy after `busyAttempts` belongs to a new
+    /// session, which restores Auto itself, or to a stalled helper stuck in the kernel.
+    static func retry(attempts: Int = 300, busyAttempts: Int = 30, isBusy: (Error) -> Bool,
+                      delay: () -> Void, _ attempt: () throws -> Void) -> Bool {
+        var busy = 0
+        for _ in 0..<attempts {
+            do { try attempt(); return true }
+            catch where isBusy(error) {
+                busy += 1
+                if busy >= busyAttempts { return false }
+            } catch { }
+            delay()
+        }
+        return false
+    }
 }

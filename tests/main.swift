@@ -109,6 +109,17 @@ check(!failed && secondFanMode == 0, "Restore other fans even if one cannot be v
 let rejected = AutomaticRestoration.restore(keys: ["F0md"], readMode: { _ in 1 },
     writeAutomatic: { _ in throw Failure("Write rejected") }, retryDelay: {})
 check(!rejected, "Report failure when automatic control cannot be restored")
+var smcFailures = 0
+check(AutomaticRestoration.retry(isBusy: { _ in false }, delay: {}) {
+    smcFailures += 1
+    if smcFailures <= 100 { throw Failure("SMC unavailable") }
+}, "Watchdog keeps restoring through SMC failures longer than a few seconds")
+var busyTries = 0
+check(!AutomaticRestoration.retry(isBusy: { _ in true }, delay: {}) { busyTries += 1; throw Failure("busy") } && busyTries == 30,
+      "Watchdog stops waiting on a lock held by a new session")
+var smcTries = 0
+check(!AutomaticRestoration.retry(isBusy: { _ in false }, delay: {}) { smcTries += 1; throw Failure("SMC unavailable") } && smcTries == 300,
+      "Watchdog gives up after 30 seconds of SMC failures")
 check(TemperatureReading.cpu.level(69) == .normal && TemperatureReading.cpu.level(70) == .warm &&
       TemperatureReading.cpu.level(85) == .hot, "CPU color bands")
 check(TemperatureReading.battery.level(34) == .normal && TemperatureReading.battery.level(35) == .warm &&
