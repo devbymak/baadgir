@@ -10,11 +10,12 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 
 - CPU/GPU/battery/SSD temperatures, fan RPM, and macOS thermal pressure, coloured green/yellow/red.
 - System power draw and adapter input in watts (display only).
-- Settings window (popover → Settings…, or right-click → Settings…) for launch at login, menu bar readings, colours, and manual speed limits.
+- Settings window (popover → Settings…, or right-click → Settings…) for launch at login, notifications, the hotkey, menu bar readings, colours, manual speed limits, the fan curve, and rules.
 - Last 10 minutes of CPU/GPU temperature and fan speed as small graphs in the popover, kept in memory only.
 - No logs: readings and errors are never written to disk. Only preferences (limits, speed, menu bar choices) are saved.
 - Auto / Curve / Manual / Max fan modes, from the popover or the menu bar icon's right-click menu. Curve, Manual and Max stay on until you choose Auto.
 - Fan curve: four editable temperature → RPM points with a live preview. Curve mode only takes over when the curve asks for more than macOS is running, and never runs a fan below the speed macOS had chosen.
+- Rules: return to Auto (and stay there) on battery; switch to Curve or Max when plugged in, including at launch.
 - Optional notification when fans return to Auto on their own (safety cutoff, sensor failure, helper exit), with the reason.
 - ⌃⌥M switches between Max and Auto from any app (can be turned off in Settings).
 - Shortcuts, links and command line: `baadgir://auto`, `baadgir://curve`, `baadgir://max`, `baadgir://manual?rpm=3000`, or `baadgir status | auto | curve | max | manual [RPM]`. Requests get the same safety checks as the app, and can be turned off in Settings.

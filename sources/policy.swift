@@ -284,6 +284,33 @@ struct CoolingPolicy {
     }
 }
 
+enum FanMode: String, Hashable { case auto, curve, manual, maximum }
+
+enum PowerSource { case adapter, battery, unknown }
+
+/// Optional rules that change fan mode when the Mac is plugged in or unplugged.
+struct PowerRules: Equatable {
+    /// On battery, end any session and keep automatic cooling.
+    var autoOnBattery = false
+    /// Mode to start when power is connected (or at launch while plugged in): Curve or Max, or nil.
+    var onAdapter: FanMode?
+    /// The mode to switch to after the source changes from `old` (nil at launch) to `new`, given the current mode.
+    func mode(from old: PowerSource?, to new: PowerSource, current: FanMode) -> FanMode? {
+        guard old != new else { return nil }
+        switch new {
+        case .battery: return autoOnBattery && current != .auto ? .auto : nil
+        // Only from Auto: never override a mode the user picked.
+        case .adapter: return current == .auto && onAdapter != .auto ? onAdapter : nil
+        case .unknown: return nil
+        }
+    }
+    /// Why `mode` can't be chosen right now, if a rule forbids it.
+    func blocker(for mode: FanMode, on source: PowerSource) -> String? {
+        guard autoOnBattery, source == .battery, mode != .auto else { return nil }
+        return "On battery, Baadgir keeps automatic cooling. Change this in Settings › Rules."
+    }
+}
+
 /// A fan-mode request from a baadgir:// link, Shortcuts, or the command line.
 /// It goes through the same checks as choosing the mode in the app.
 enum RemoteCommand: Equatable {

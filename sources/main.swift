@@ -5,6 +5,7 @@ import Darwin
 import ServiceManagement
 import UserNotifications
 import Carbon.HIToolbox
+import IOKit.ps
 
 struct Fan {
     let index: Int
@@ -141,6 +142,15 @@ final class SMC {
     }
 }
 
+func currentPowerSource() -> PowerSource {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String? else { return .unknown }
+    switch type {
+    case kIOPMACPowerKey: return .adapter
+    case kIOPMBatteryPowerKey: return .battery
+    default: return .unknown
+    }
+}
 func thermalLevel() -> ThermalLevel {
     switch ProcessInfo.processInfo.thermalState {
     case .nominal: return .nominal
@@ -374,8 +384,6 @@ func restoreAutomatic() throws {
     }
 }
 
-enum FanMode: Hashable { case auto, curve, manual, maximum }
-
 final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
     @Published var temperatures: Temperatures?
@@ -458,6 +466,25 @@ final class CoolingModel: ObservableObject {
             }
             select(.manual)
         }
+    }
+    @Published var rules = PowerRules(
+        autoOnBattery: UserDefaults.standard.bool(forKey: "autoOnBattery"),
+        onAdapter: UserDefaults.standard.string(forKey: "onAdapterMode").flatMap(FanMode.init(rawValue:))) {
+        didSet {
+            defaults.set(rules.autoOnBattery, forKey: "autoOnBattery")
+            defaults.set(rules.onAdapter?.rawValue, forKey: "onAdapterMode")
+            // Apply a newly enabled battery rule right away.
+            if rules.autoOnBattery, !oldValue.autoOnBattery, sessionRunning, currentPowerSource() == .battery { select(.auto) }
+        }
+    }
+    private var lastPowerSource: PowerSource?
+    /// Switches mode when the power source changes, as the rules ask.
+    private func applyRules() {
+        let source = currentPowerSource()
+        defer { lastPowerSource = source }
+        guard pending == nil, let mode = rules.mode(from: lastPowerSource, to: source, current: sessionRunning ? mode : .auto)
+        else { return }
+        select(mode)
     }
     /// True once the first sensor read has finished, so queued link requests see real readings.
     @Published private(set) var hasRead = false
@@ -625,6 +652,8 @@ final class CoolingModel: ObservableObject {
                 if self.sessionRunning && [.manual, .curve].contains(self.mode) && temperatures == nil {
                     self.endSession(reason: "Temperature readings stopped: \(errorMessage)")
                 }
+                // After limits and the curve are loaded, so a rule can start Curve at launch.
+                self.applyRules()
                 self.onUpdate?()
             }
         }
@@ -634,6 +663,7 @@ final class CoolingModel: ObservableObject {
 
     func select(_ newMode: FanMode) {
         message = nil
+        if let reason = rules.blocker(for: newMode, on: currentPowerSource()) { message = reason; onUpdate?(); return }
         switch newMode {
         case .auto:
             if sessionRunning { endSession() }
@@ -985,11 +1015,25 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             .disabled(model.bounds == nil)
+            Section {
+                Toggle("On battery, return to Auto and stay there", isOn: $model.rules.autoOnBattery)
+                Picker("When plugged in", selection: $model.rules.onAdapter) {
+                    Text("Do nothing").tag(FanMode?.none)
+                    Text("Switch to Curve").tag(FanMode?.some(.curve))
+                    Text("Switch to Max").tag(FanMode?.some(.maximum))
+                }
+            } header: {
+                Text("Rules")
+            } footer: {
+                Text("The plugged-in rule runs when you connect power and when Baadgir starts while plugged in, only if fans are on Auto. Starting a mode may ask for your administrator password.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .disabled(model.bounds == nil)
         }
         .formStyle(.grouped)
-        .frame(width: 440)
+        // Fixed height so the window fits small screens; the form scrolls.
+        .frame(width: 440, height: 680)
         .onAppear { model.refreshLoginItemStatus() }
-        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -1319,13 +1363,16 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         model.refreshLoginItemStatus()
         if settingsWindow == nil {
             let host = NSHostingController(rootView: SettingsView(model: model))
-            host.sizingOptions = .preferredContentSize
+            host.sizingOptions = .standardBounds
             let window = NSWindow(contentViewController: host)
             window.title = "Baadgir Settings"
-            window.styleMask = [.titled, .closable]
+            window.styleMask = [.titled, .closable, .resizable]
             window.isReleasedWhenClosed = false
-            // Size to the SwiftUI content first; centering the default-sized window leaves it off-center once it grows.
-            window.setContentSize(host.view.fittingSize)
+            // The form is taller than many screens: fit the window to the screen and let the form scroll,
+            // sizing it before centering so it doesn't grow off-center afterward.
+            let ideal = NSHostingView(rootView: SettingsView(model: model).fixedSize(horizontal: false, vertical: true)).fittingSize
+            let available = (NSScreen.main?.visibleFrame.height ?? ideal.height) - 60
+            window.setContentSize(NSSize(width: ideal.width, height: min(ideal.height, available)))
             window.center()
             settingsWindow = window
         }

@@ -185,4 +185,17 @@ try check(try RemoteCommand(arguments: ["MAX"]) == .maximum, "Command-line words
 for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["off"]] {
     rejects("Bad command \(words)") { _ = try RemoteCommand(arguments: words) }
 }
+var rules = PowerRules()
+check(rules.mode(from: .adapter, to: .battery, current: .maximum) == nil && rules.mode(from: nil, to: .adapter, current: .auto) == nil,
+      "Rules do nothing until turned on")
+rules.autoOnBattery = true; rules.onAdapter = .curve
+check(rules.mode(from: .adapter, to: .battery, current: .manual) == .auto, "Unplugging returns to Auto")
+check(rules.mode(from: .adapter, to: .battery, current: .auto) == nil, "Already on Auto when unplugged")
+check(rules.mode(from: .battery, to: .adapter, current: .auto) == .curve, "Plugging in starts the chosen mode")
+check(rules.mode(from: nil, to: .adapter, current: .auto) == .curve, "Launching while plugged in starts the chosen mode")
+check(rules.mode(from: .battery, to: .adapter, current: .manual) == nil, "Plugging in never overrides the user's mode")
+check(rules.mode(from: .adapter, to: .adapter, current: .auto) == nil, "No change, no action")
+check(rules.mode(from: .adapter, to: .unknown, current: .manual) == nil, "Unknown power source changes nothing")
+check(rules.blocker(for: .maximum, on: .battery) != nil && rules.blocker(for: .auto, on: .battery) == nil &&
+      rules.blocker(for: .curve, on: .adapter) == nil, "Battery rule blocks only non-Auto modes on battery")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
