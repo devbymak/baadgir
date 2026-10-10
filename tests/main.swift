@@ -161,21 +161,29 @@ check(oddSpeeds.allSatisfy { $0 >= oddHardware.minimum && $0 <= oddHardware.maxi
 check(CoolingTarget.manual(rpm: 2000).isManual && !CoolingTarget.maximum.isManual && !CoolingTarget.curve(curve).isManual,
       "Only a manual target counts as already in Manual, so switching from Max or Curve uses the start limit")
 var controller = CurveController()
-check(controller.targets(desired: 2500, actual: [2300], maximums: [6000], now: 0) == nil,
+check(controller.targets(desired: 2500, actual: [2300], minimums: [1000], maximums: [6000], now: 0) == nil,
       "Curve leaves fans with macOS unless it clearly wants more")
-check(controller.targets(desired: 3000, actual: [2300], maximums: [6000], now: 1) == [3000], "Curve takes over above macOS")
-check(controller.targets(desired: 2000, actual: [3000], maximums: [6000], now: 2) == [2900], "Speed drops gradually")
-check(controller.targets(desired: 2000, actual: [3000], maximums: [6000], now: 3) == [2800], "Speed keeps dropping gradually")
-for step in 4...30 { _ = controller.targets(desired: 2000, actual: [2300], maximums: [6000], now: Double(step) * 0.1 + 3) }
+check(controller.targets(desired: 3000, actual: [2300], minimums: [1000], maximums: [6000], now: 1) == [3000], "Curve takes over above macOS")
+check(controller.targets(desired: 2000, actual: [3000], minimums: [1000], maximums: [6000], now: 2) == [2900], "Speed drops gradually")
+check(controller.targets(desired: 2000, actual: [3000], minimums: [1000], maximums: [6000], now: 3) == [2800], "Speed keeps dropping gradually")
+for step in 4...30 { _ = controller.targets(desired: 2000, actual: [2300], minimums: [1000], maximums: [6000], now: Double(step) * 0.1 + 3) }
 check(controller.applied == [2300], "Never below the speed macOS had chosen")
-check(controller.targets(desired: 2000, actual: [2300], maximums: [6000], now: 12.5) == nil && !controller.engaged,
+check(controller.targets(desired: 2000, actual: [2300], minimums: [1000], maximums: [6000], now: 12.5) == nil && !controller.engaged,
       "Hand fans back to macOS once the curve stays at or below its speed")
-check(controller.targets(desired: .infinity, actual: [2300, 2500], maximums: [6000, 5800], now: 20) == [6000, 5800],
+check(controller.targets(desired: .infinity, actual: [2300, 2500], minimums: [1000, 1000], maximums: [6000, 5800], now: 20) == [6000, 5800],
       "Maximum respects each fan's own limit")
-check(controller.targets(desired: 3000, actual: [6000, 5800], maximums: [6000, 5800], now: 21) == [5900, 5700],
+check(controller.targets(desired: 3000, actual: [6000, 5800], minimums: [1000, 1000], maximums: [6000, 5800], now: 21) == [5900, 5700],
       "Leaving maximum also ramps down")
-check(controller.targets(desired: 5950, actual: [3000, 3000], maximums: [6000, 5800], now: 21.5) == [5950, 5800],
+check(controller.targets(desired: 5950, actual: [3000, 3000], minimums: [1000, 1000], maximums: [6000, 5800], now: 21.5) == [5950, 5800],
       "Rising curve applies immediately")
+var idle = CurveController()
+check(idle.targets(desired: 1200, actual: [0, 0], minimums: [1200, 1000], maximums: [6000, 5800], now: 0) == nil,
+      "A stopped fan counts as its minimum, so the curve's lowest speed leaves it with macOS")
+check(idle.targets(desired: 2000, actual: [0, 0], minimums: [1200, 1000], maximums: [6000, 5800], now: 1) == [2000, 2000],
+      "Curve takes over stopped fans when it clearly wants more than their minimum")
+check(idle.applied!.allSatisfy { $0 >= 1200 }, "Never targets a stopped fan below its minimum")
+for step in 2...30 { _ = idle.targets(desired: 1200, actual: [1500, 1500], minimums: [1200, 1000], maximums: [6000, 5800], now: Double(step)) }
+check(!idle.engaged, "Hand fans that macOS had stopped back once the curve falls to their minimum")
 var ring = RingBuffer<Int>(capacity: 3)
 for value in 1...2 { ring.append(value) }
 check(ring.elements == [1, 2], "History keeps order before it fills")

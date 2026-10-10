@@ -117,7 +117,7 @@ final class SMC {
         guard count <= 8, count.rounded() == count else { throw Failure("Unexpected fan count") }
         return try (0..<Int(count)).map { index in
             let prefix = "F\(index)"
-            let modeKey = (try? read(prefix + "md")) != nil ? prefix + "md" : prefix + "Md"
+            let modeKey = modeKey(index)
             let mode = try number(modeKey)
             guard [Float(0), 1, 3].contains(mode) else { throw Failure("Unknown fan mode") }
             let maximum = try number(prefix + "Mx")
@@ -129,6 +129,17 @@ final class SMC {
             return Fan(index: index, rpm: rpm, minimum: minimum, maximum: maximum,
                        modeKey: modeKey, mode: UInt8(mode))
         }
+    }
+    /// Every fan's mode key, without the speed and range checks in `fans()`, so restoring Auto never waits on other readings.
+    func modeKeys() throws -> [String] {
+        let count: Float
+        do { count = try number("FNum") }
+        catch let error as SMCFailure where error.keyNotFound { return [] }
+        guard count <= 8, count.rounded() == count else { throw Failure("Unexpected fan count") }
+        return (0..<Int(count)).map(modeKey)
+    }
+    private func modeKey(_ index: Int) -> String {
+        (try? read("F\(index)md")) != nil ? "F\(index)md" : "F\(index)Md"
     }
     // The only writable keys are fan target and mode. No diagnostic unlocks.
     func write(_ key: String, expectedType: String, bytes: [UInt8]) throws {
@@ -366,7 +377,8 @@ func coolingSession(parent: pid_t, directory: String) throws {
                 }
                 let desired = CoolingPolicy.curveSpeed(curve, try smc.temperatures(), thermal: thermalLevel())
                 wanted = curveController.targets(desired: desired, actual: try smc.fans().map { Double($0.rpm) },
-                    maximums: fans.map { Double($0.maximum) }, now: ProcessInfo.processInfo.systemUptime)?.map(Float.init)
+                    minimums: fans.map { Double(max(1000, $0.minimum)) }, maximums: fans.map { Double($0.maximum) },
+                    now: ProcessInfo.processInfo.systemUptime)?.map(Float.init)
             }
             if case .curve = target {} else { curveController = CurveController() }
             if let wanted {
@@ -478,8 +490,9 @@ func restoreAutomatic(locking: Bool = true) throws {
     let lock = locking ? try acquireLock() : -1
     defer { if lock >= 0 { close(lock) } }
     let smc = try SMC()
-    let manual = try smc.fans().filter { $0.mode == 1 }
-    guard AutomaticRestoration.restore(keys: manual.map(\.modeKey),
+    // Every fan, not just those reading manual: a fan whose mode can't be read or is unexpected must still be returned.
+    // Fans already on Auto need no write.
+    guard AutomaticRestoration.restore(keys: try smc.modeKeys(),
         readMode: { Double(try smc.number($0)) },
         writeAutomatic: { try smc.write($0, expectedType: "ui8 ", bytes: [0]) },
         retryDelay: { usleep(100_000) }) else {
@@ -1258,7 +1271,7 @@ struct SettingsView: View {
         } header: {
             Text("Fan Curve")
         } footer: {
-            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, fans run at maximum.")
+            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running (a stopped fan counts as its minimum), and never goes below macOS's speed. At 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, fans run at maximum.")
         }
         .disabled(model.bounds == nil)
     }
@@ -1572,13 +1585,15 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         if startsSession {
             alert.messageText = "Start \(name) cooling?"
             alert.informativeText = "A link, Shortcut, or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
-            alert.addButton(withTitle: "Start")
         } else {
             alert.messageText = "Switch to \(name)?"
             alert.informativeText = "A link, Shortcut, or command asked Baadgir to change the fan speed. Manual can run the fans slower than macOS would."
-            alert.addButton(withTitle: "Switch")
         }
-        alert.addButton(withTitle: "Cancel")
+        let accept = alert.addButton(withTitle: startsSession ? "Start" : "Switch")
+        let cancel = alert.addButton(withTitle: "Cancel")
+        // The request can pop this up mid-typing, so Return must decline: only a click accepts.
+        accept.keyEquivalent = ""
+        cancel.keyEquivalent = "\r"
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
     }
@@ -1895,6 +1910,9 @@ if arguments.contains("--probe") || arguments.dropFirst() == ["status"] {
         if arguments[1].lowercased() == "manual" { fputs("\(error)\n", stderr) }
         fputs(usage + "\n", stderr); exit(arguments[1] == "help" ? 0 : 2)
     }
+} else if geteuid() == 0 {
+    // Root runs only the helper's modes above; the app itself, with its prompts and settings, runs as the user.
+    fputs("Baadgir's app doesn't run as root.\n", stderr); exit(1)
 } else if NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
             .contains(where: { $0.processIdentifier != getpid() }) {
     // Two copies would delete each other's session folders and fight over the fans.

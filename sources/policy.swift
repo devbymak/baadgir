@@ -282,6 +282,8 @@ enum CoolingTarget: Equatable {
 
 /// Runs Curve mode on top of macOS: fans stay automatic until the curve asks for clearly more than
 /// macOS is doing, and while held they never drop below the speed macOS had chosen.
+/// A fan macOS has stopped (or runs below its minimum) counts as running at its minimum, so an idle Mac whose fans are off
+/// is handed back once the curve asks for no more than that.
 struct CurveController {
     /// Curve must exceed the fans' actual speed by this much before Baadgir takes over.
     static let engageMargin = 300.0
@@ -295,11 +297,12 @@ struct CurveController {
     private var belowSince: Double?
     var engaged: Bool { floors != nil }
     /// Per-fan targets, or nil to leave the fans with macOS. `now` is monotonic seconds.
-    mutating func targets(desired: Double, actual: [Double], maximums: [Double], now: Double) -> [Double]? {
+    mutating func targets(desired: Double, actual: [Double], minimums: [Double], maximums: [Double], now: Double) -> [Double]? {
         guard let floors, let applied else {
-            guard desired >= (actual.max() ?? .infinity) + Self.engageMargin else { return nil }
-            floors = actual; belowSince = nil
-            applied = zip(actual, maximums).map { min(max(desired, $0), $1) }
+            let running = zip(actual, minimums).map { max($0, $1) }
+            guard desired >= (running.max() ?? .infinity) + Self.engageMargin else { return nil }
+            floors = running; belowSince = nil
+            applied = zip(running, maximums).map { min(max(desired, $0), $1) }
             return applied
         }
         if desired <= floors.max()! {
