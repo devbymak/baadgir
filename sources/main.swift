@@ -580,9 +580,11 @@ final class CoolingModel: ObservableObject {
     private var lastPowerSource: PowerSource?
     /// Switches mode when the power source changes, as the rules ask.
     private func applyRules() {
+        // Wait out a pending prompt or restore without recording the source, so a change meanwhile still applies after it.
+        guard !fanless, pending == nil else { return }
         let source = currentPowerSource()
         defer { lastPowerSource = source }
-        guard !fanless, pending == nil, let mode = rules.mode(from: lastPowerSource, to: source, current: sessionRunning ? mode : .auto)
+        guard let mode = rules.mode(from: lastPowerSource, to: source, current: sessionRunning ? mode : .auto)
         else { return }
         select(mode)
     }
