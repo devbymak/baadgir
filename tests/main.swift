@@ -200,6 +200,12 @@ check(rules.mode(from: .adapter, to: .adapter, current: .auto) == nil, "No chang
 check(rules.mode(from: .adapter, to: .unknown, current: .manual) == nil, "Unknown power source changes nothing")
 check(rules.blocker(for: .maximum, on: .battery) != nil && rules.blocker(for: .auto, on: .battery) == nil &&
       rules.blocker(for: .curve, on: .adapter) == nil, "Battery rule blocks only non-Auto modes on battery")
+check(TemperatureReading.fan.text(2496.4, compact: false) == "2496 RPM" && TemperatureReading.fan.text(2496.4, compact: true) == "2496" &&
+      TemperatureReading.cpu.text(71.6, compact: false) == "72°C" && TemperatureReading.cpu.text(nil, compact: true) == "—°",
+      "Menu bar text uses RPM for the fan and °C for temperatures")
+check(TemperatureReading.fan.level(6000) == nil && TemperatureReading.fan.value(in: normal) == nil &&
+      TemperatureReading.fan.text(TemperatureReading.fan.widest, compact: true).count >= 4,
+      "Fan speed has no heat colour, isn't a temperature, and reserves four digits")
 let userFile = NSTemporaryDirectory() + "baadgir-test-" + UUID().uuidString
 FileManager.default.createFile(atPath: userFile, contents: Data())
 check(isRootOwned("/bin/sh") && !isRootOwned(userFile) && !isRootOwned("/bin") && !isRootOwned("bin/sh") &&

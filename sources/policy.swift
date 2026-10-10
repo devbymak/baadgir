@@ -73,9 +73,9 @@ enum HeatLevel: Int, Comparable {
     }
 }
 
-/// Which temperature the menu bar shows.
+/// Which readings the menu bar shows: temperatures, and the fan speed.
 enum TemperatureReading: String, CaseIterable {
-    case hottest, cpu, gpu, battery, ssd
+    case hottest, cpu, gpu, battery, ssd, fan
     var title: String {
         switch self {
         case .hottest: return "Hottest (CPU or GPU)"
@@ -83,6 +83,7 @@ enum TemperatureReading: String, CaseIterable {
         case .gpu: return "GPU"
         case .battery: return "Battery"
         case .ssd: return "SSD"
+        case .fan: return "Fan speed"
         }
     }
     /// One-letter prefix used when the menu bar shows several readings.
@@ -93,8 +94,10 @@ enum TemperatureReading: String, CaseIterable {
         case .gpu: return "G"
         case .battery: return "B"
         case .ssd: return "S"
+        case .fan: return "F"
         }
     }
+    /// Temperatures only; the fan speed comes from the fans.
     func value(in temperatures: Temperatures) -> Double? {
         switch self {
         case .hottest: return temperatures.highest
@@ -102,15 +105,25 @@ enum TemperatureReading: String, CaseIterable {
         case .gpu: return temperatures.gpu
         case .battery: return temperatures.battery
         case .ssd: return temperatures.ssd
+        case .fan: return nil
         }
     }
-    /// Display bands only; the cooling cutoffs live in `CoolingPolicy`.
-    func level(_ value: Double) -> HeatLevel {
+    /// "72°C" or "2500 RPM"; compact drops the unit to "72°" or "2500" when several readings share the menu bar.
+    func text(_ value: Double?, compact: Bool) -> String {
+        let number = value.map { String(Int($0.rounded())) } ?? "—"
+        if self == .fan { return compact ? number : number + " RPM" }
+        return number + (compact ? "°" : "°C")
+    }
+    /// The widest value to reserve room for, so the menu bar item never shifts as numbers change.
+    var widest: Double { self == .fan ? 9999 : 130 }
+    /// Display bands only; the cooling cutoffs live in `CoolingPolicy`. Fan speed has no colour.
+    func level(_ value: Double) -> HeatLevel? {
         let (warm, hot): (Double, Double)
         switch self {
         case .battery: (warm, hot) = (35, 40)
         case .ssd: (warm, hot) = (55, 70)
         case .hottest, .cpu, .gpu: (warm, hot) = (70, 85)
+        case .fan: return nil
         }
         return value >= hot ? .hot : value >= warm ? .warm : .normal
     }

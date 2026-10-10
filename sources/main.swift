@@ -543,8 +543,14 @@ final class CoolingModel: ObservableObject {
     }
     /// Colour band for a reading, or nil when colours are off or the value is missing.
     func heatLevel(_ reading: TemperatureReading, _ value: Double?) -> HeatLevel? {
-        guard colorsTemperatures, let value else { return nil }
-        return reading.level(value).raised(by: thermalLevel())
+        guard colorsTemperatures, let value, let level = reading.level(value) else { return nil }
+        return level.raised(by: thermalLevel())
+    }
+    /// Average speed of all fans, as in the history graph; nil before the first read.
+    var fanSpeed: Double? { fans.isEmpty ? nil : fans.map { Double($0.rpm) }.reduce(0, +) / Double(fans.count) }
+    /// The current value of a menu bar reading.
+    func value(of reading: TemperatureReading) -> Double? {
+        reading == .fan ? fanSpeed : temperatures.flatMap { reading.value(in: $0) }
     }
     /// Mirrors the login item's registration; System Settings can change it behind our back.
     @Published private(set) var loginItemStatus = SMAppService.mainApp.status
@@ -689,8 +695,7 @@ final class CoolingModel: ObservableObject {
                 self.reading = false
                 self.fans = fans; self.temperatures = temperatures; self.power = power; self.sensorError = errorMessage
                 self.hasRead = true
-                self.history.append(HistorySample(cpu: temperatures?.cpu, gpu: temperatures?.gpu,
-                    fan: fans.isEmpty ? nil : fans.map { Double($0.rpm) }.reduce(0, +) / Double(fans.count)))
+                self.history.append(HistorySample(cpu: temperatures?.cpu, gpu: temperatures?.gpu, fan: self.fanSpeed))
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
                 if !self.initializedLimits, let bounds = self.bounds { self.loadLimits(bounds) }
                 if self.sessionRunning, self.pending != nil, self.stopRequested == false, let directory = self.directory,
@@ -1321,9 +1326,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private var statusSymbol: NSImage? {
         model.showsMenuBarIcon ? NSImage(systemSymbolName: symbol, accessibilityDescription: "Baadgir") : nil
     }
-    private func currentValue(_ reading: TemperatureReading) -> Double? {
-        model.temperatures.flatMap { reading.value(in: $0) }
-    }
+    private func currentValue(_ reading: TemperatureReading) -> Double? { model.value(of: reading) }
     private var titleFont: NSFont { .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
     /// One reading shows " 72°C"; several show " C 72°  G 64°" with letter prefixes. No leading space without the icon.
     private func title(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSAttributedString {
@@ -1342,8 +1345,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             if colored, let level = model.heatLevel(reading, value(reading)) {
                 attributes[.foregroundColor] = NSColor.heat(level)
             }
-            let number = value(reading).map { String(Int($0.rounded())) } ?? "—"
-            text.append(NSAttributedString(string: number + (readings.count > 1 ? "°" : "°C"), attributes: attributes))
+            text.append(NSAttributedString(string: reading.text(value(reading), compact: readings.count > 1), attributes: attributes))
         }
         return text
     }
@@ -1359,7 +1361,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         func width(_ text: String) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
         let letterWidth = TemperatureReading.allCases.map { width($0.letter) }.max() ?? 0
         let gap: CGFloat = 3, spacing: CGFloat = 7
-        let column = letterWidth + gap + width("130°")  // Sized for the widest value so the item never shifts.
+        // Sized for the widest value so the item never shifts.
+        let column = letterWidth + gap + (model.menuBarReadings.map { width($0.text($0.widest, compact: true)) }.max() ?? 0)
         let configuration = NSImage.SymbolConfiguration(pointSize: NSFont.systemFontSize, weight: .regular)
             .applying(NSImage.SymbolConfiguration(paletteColors: [.labelColor]))
         let fan = model.showsMenuBarIcon
@@ -1368,8 +1371,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         let columns = MenuBarLayout.columns(model.menuBarReadings).map { column in
             column.map { reading -> (letter: String, number: String, color: NSColor) in
                 let level = colored ? model.heatLevel(reading, value(reading)) : nil
-                return (reading.letter, (value(reading).map { String(Int($0.rounded())) } ?? "—") + "°",
-                        level.map(NSColor.heat) ?? .labelColor)
+                return (reading.letter, reading.text(value(reading), compact: true), level.map(NSColor.heat) ?? .labelColor)
             }
         }
         let size = NSSize(width: fanWidth + CGFloat(columns.count) * column + CGFloat(max(columns.count - 1, 0)) * spacing,
@@ -1396,7 +1398,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private func updateStackedImage() {
         item.button?.image = stackedImage(currentValue, colored: true)
         item.button?.setAccessibilityValue(model.menuBarReadings.map { reading in
-            "\(reading.title) " + (currentValue(reading).map { "\(Int($0.rounded()))°C" } ?? "unavailable")
+            "\(reading.title) " + (currentValue(reading).map { reading.text($0, compact: false) } ?? "unavailable")
         }.joined(separator: ", "))
     }
     /// Sizes the item for the widest readings so it (and the popover anchored to it) never shifts as numbers change.
@@ -1405,7 +1407,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         if stacked {
             button.attributedTitle = NSAttributedString()
             button.imagePosition = .imageOnly
-            item.length = stackedImage({ _ in 130 }, colored: false).size.width + 8
+            item.length = stackedImage(\.widest, colored: false).size.width + 8
             updateStackedImage()
             return
         }
@@ -1414,7 +1416,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         button.imagePosition = model.showsMenuBarIcon ? .imageLeading : .noImage
         button.font = titleFont
         button.alignment = .center
-        button.attributedTitle = title({ _ in 130 }, colored: false)
+        button.attributedTitle = title(\.widest, colored: false)
         // Measure without a width limit; `fittingSize` is constrained by the current length.
         let unbounded = NSRect(x: 0, y: 0, width: 10_000, height: NSStatusBar.system.thickness)
         item.length = ceil(button.cell?.cellSize(forBounds: unbounded).width ?? button.fittingSize.width) + 4
