@@ -168,15 +168,15 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     var status = "Automatic cooling"
     var boosting = false
     func applicationDidFinishLaunching(_ notification: Notification) {
-        item.button?.image = NSImage(systemSymbolName: "fan", accessibilityDescription: "parvanak")
-        item.button?.setAccessibilityLabel("parvanak cooling controls")
+        item.button?.image = NSImage(systemSymbolName: "fan", accessibilityDescription: "Parvanak")
+        item.button?.setAccessibilityLabel("Parvanak cooling controls")
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
         refresh()
     }
     func refresh() {
         let menu = NSMenu()
-        menu.addItem(withTitle: "parvanak", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Parvanak", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: status, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         var readable = false
@@ -196,7 +196,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         let auto = menu.addItem(withTitle: "End boost · Return to automatic", action: #selector(stop), keyEquivalent: "a")
         auto.target = self; auto.isEnabled = helper != nil
         menu.addItem(.separator())
-        let quit = menu.addItem(withTitle: "Quit parvanak", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = menu.addItem(withTitle: "Quit Parvanak", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.autoenablesItems = false
         item.menu = menu

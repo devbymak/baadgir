@@ -1,4 +1,4 @@
-# parvanak
+# Parvanak
 
 A small, open-source macOS menu bar app for monitoring fans and requesting a short cooling boost. Built with Swift and AppKit, with no third-party dependencies.
 
@@ -15,7 +15,7 @@ Requires an Apple silicon Mac and Xcode Command Line Tools.
 
 ```sh
 ./build.sh
-open parvanak.app
+open Parvanak.app
 ```
 
 Cooling boosts require macOS administrator authorization. Monitoring does not.
