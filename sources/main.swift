@@ -3,6 +3,7 @@ import SwiftUI
 import IOKit
 import Darwin
 import ServiceManagement
+import UserNotifications
 
 struct Fan {
     let index: Int
@@ -399,6 +400,23 @@ final class CoolingModel: ObservableObject {
             menuBarReadings = TemperatureReading.allCases.filter { $0 == reading || menuBarReadings.contains($0) }
         }
     }
+    @Published var notifiesOnReturn = UserDefaults.standard.object(forKey: "notifiesOnReturn") as? Bool ?? true {
+        didSet {
+            defaults.set(notifiesOnReturn, forKey: "notifiesOnReturn")
+            if notifiesOnReturn { requestNotificationPermission() }
+        }
+    }
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+    /// Tells the user when fans went back to Auto without being asked, for example after a safety cutoff.
+    private func notifyReturn(_ reason: String) {
+        guard notifiesOnReturn else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Fans are back on Auto"
+        content.body = reason
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
     @Published var colorsTemperatures = UserDefaults.standard.object(forKey: "colorsTemperatures") as? Bool ?? true {
         didSet { defaults.set(colorsTemperatures, forKey: "colorsTemperatures"); onUpdate?() }
     }
@@ -551,11 +569,13 @@ final class CoolingModel: ObservableObject {
                 if !self.initializedLimits, let bounds = self.bounds { self.loadLimits(bounds) }
                 if self.sessionRunning, self.pending != nil, self.stopRequested == false, let directory = self.directory,
                    FileManager.default.fileExists(atPath: directory.appendingPathComponent("running").path) {
-                    self.pending = nil
+                    self.pending = nil; self.sessionStarted = true
                 }
                 // The helper performs its own independent sensor checks as well.
                 // Maximum cooling can run without temperatures; its RPM is never reduced.
-                if self.sessionRunning && [.manual, .curve].contains(self.mode) && temperatures == nil { self.endSession() }
+                if self.sessionRunning && [.manual, .curve].contains(self.mode) && temperatures == nil {
+                    self.endSession(reason: "Temperature readings stopped: \(errorMessage)")
+                }
                 self.onUpdate?()
             }
         }
@@ -619,17 +639,26 @@ final class CoolingModel: ObservableObject {
         catch { message = "Cannot update fan speed: \(error.localizedDescription)" }
     }
     private var stopRequested = false
+    /// Set once the helper reports it is running, so failures before that aren't reported as a return to Auto.
+    private var sessionStarted = false
+    /// Why the app itself ended the session, when the user didn't ask.
+    private var forcedReason: String?
     private func startSession(_ newMode: FanMode) {
         guard helper == nil else { return }
+        if notifiesOnReturn { requestNotificationPermission() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("baadgir-" + UUID().uuidString)
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         catch { message = "Cannot create cooling session: \(error)"; return }
         self.directory = directory
-        mode = newMode; sessionRunning = true; stopRequested = false
+        mode = newMode; sessionRunning = true; stopRequested = false; sessionStarted = false; forcedReason = nil
         heartbeat()
-        let started = runPrivileged(["--control", String(getpid()), directory.path]) { [weak self] success in
+        let started = runPrivileged(["--control", String(getpid()), directory.path]) { [weak self] success, error in
             guard let self else { return }
-            self.directory = nil; self.sessionRunning = false
+            if let reason = self.forcedReason { self.notifyReturn(reason) }
+            else if self.sessionStarted && !self.stopRequested {
+                self.notifyReturn(success ? "The cooling session ended." : error)
+            }
+            self.directory = nil; self.sessionRunning = false; self.sessionStarted = false; self.forcedReason = nil
             self.mode = .auto; self.pending = nil; self.stopRequested = false
             try? FileManager.default.removeItem(at: directory)
             if success { self.message = nil }
@@ -640,8 +669,10 @@ final class CoolingModel: ObservableObject {
             try? FileManager.default.removeItem(at: directory)
         }
     }
-    func endSession() {
+    /// Pass a reason when the app, not the user, decided to stop; it is shown as a notification.
+    func endSession(reason: String? = nil) {
         guard sessionRunning, let directory else { return }
+        if let reason, forcedReason == nil { forcedReason = reason }
         stopRequested = true
         if !FileManager.default.createFile(atPath: directory.appendingPathComponent("stop").path, contents: Data()) {
             // Without fresh heartbeats the helper still restores Auto within seconds.
@@ -651,12 +682,12 @@ final class CoolingModel: ObservableObject {
     }
     private func restoreAutomaticControl() {
         guard helper == nil else { return }
-        if runPrivileged(["--restore"], completion: { [weak self] _ in self?.pending = nil }) {
+        if runPrivileged(["--restore"], completion: { [weak self] _, _ in self?.pending = nil }) {
             pending = "Restoring automatic cooling…"
         }
     }
     /// Runs this executable as root through an administrator prompt. Returns false if it could not launch.
-    private func runPrivileged(_ arguments: [String], completion: @escaping (Bool) -> Void) -> Bool {
+    private func runPrivileged(_ arguments: [String], completion: @escaping (Bool, String) -> Void) -> Bool {
         let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
         let command = ([executable] + arguments).map(shellQuote).joined(separator: " ")
         let literal = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -672,8 +703,9 @@ final class CoolingModel: ObservableObject {
                 self.helper = nil
                 // The last sensor read may predate restoration; don't report a stuck fan from it.
                 self.settlingUntil = Date().addingTimeInterval(2)
-                completion(success)
-                if !success { self.message = Self.readableError(error) }
+                let readable = Self.readableError(error)
+                completion(success, readable)
+                if !success { self.message = readable }
                 self.refresh(); self.onUpdate?()
             }
         }
@@ -833,6 +865,7 @@ struct SettingsView: View {
                         Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
+                Toggle("Notify when fans return to Auto on their own", isOn: $model.notifiesOnReturn)
                 if let error = model.loginItemError {
                     Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                 }
@@ -947,7 +980,7 @@ extension NSColor {
     }
 }
 
-final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let model = CoolingModel()
     let popover = NSPopover()
@@ -974,7 +1007,13 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(timer!, forMode: .common)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
         removeStaleSessions()
+        UNUserNotificationCenter.current().delegate = self
         model.refresh()
+    }
+    // Menu bar apps count as active while their popover is open; show banners anyway.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
     }
     /// Deletes session folders left by a crash, so no control files linger on disk.
     private func removeStaleSessions() {
