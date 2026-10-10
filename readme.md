@@ -1,66 +1,115 @@
-# Baadgir
+<div align="center">
 
-*Baadgir* (بادگیر, "windcatcher") is named after the Persian towers that cool buildings by catching the wind.
+# Baadgir: Mac fan control and temperature monitor
 
-<img src="assets/app-icon.png" width="96" alt="Baadgir icon">
+**A free, open-source menu bar app for Apple silicon Macs.**
+See CPU, GPU, battery and SSD temperatures at a glance, and take control of your fans when macOS waits too long.
 
-A small, open-source macOS menu bar app for temperature monitoring and fan control. Built with Swift, SwiftUI, and AppKit, with no third-party dependencies.
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
+![Apple silicon M1–M5](https://img.shields.io/badge/Apple%20silicon-M1%E2%80%93M5-blue)
+![Swift](https://img.shields.io/badge/Swift-native-orange?logo=swift&logoColor=white)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-## Features
+</div>
 
-- CPU/GPU/battery/SSD temperatures, fan RPM, and macOS thermal pressure, colored green/yellow/red.
-- Menu bar shows any mix of hottest, CPU, GPU, battery, and SSD temperature and average fan speed (Settings → Appearance).
-- System power draw and adapter input in watts (display only).
-- Menu bar readings in one row, or stacked two to a column in a smaller font (Settings → Appearance → Layout). The fan icon can be hidden to save space.
-- Settings window (popover → Settings…, or right-click → Settings…) with General, Appearance (menu bar readings, layout, colors, history graphs), Fans (the fan curve, Advanced mode and manual speed limits), and Automation (power rules, the hotkey, Shortcuts and links) tabs.
-- Popover graphs of the last 10 minutes of CPU/GPU temperature and fan speed, with value and time axes (hover for exact values), kept in memory only.
-- No logs: readings and errors are never written to disk. Only preferences (limits, speed, menu bar choices) are saved.
-- Auto / Curve / Max fan modes, from the popover or the menu bar icon's right-click menu, plus Manual once Settings → Fans → Advanced is on. Every mode except Auto stays on until you choose Auto.
-- Fan curve: four editable temperature → RPM points with a live preview. Curve mode only takes over when the curve asks for more than macOS is running (a fan macOS has stopped counts as its minimum speed), and never runs a fan below the speed macOS had chosen or below a safe minimum for the temperature (the fans' minimum up to 65°C, a quarter of their range at 72°C, half at 78°C). Curve points under the safe minimum are refused, and Settings draws it as a dashed line.
-- Rules: return to Auto (and stay there) on battery; switch to Curve or Max when plugged in, including at launch.
-- Optional notification when fans return to Auto on their own (safety cutoff, sensor failure, helper exit), with the reason.
-- ⌃⌥M switches between Max and Auto from any app (can be turned off in Settings → Automation).
-- Shortcuts, links, and command line: `baadgir://auto`, `baadgir://curve`, `baadgir://max`, `baadgir://manual?rpm=3000`, or `baadgir status | auto | curve | max | manual [RPM]`. Requests get the same safety checks as the app, and one that would start cooling or pick a manual speed asks for confirmation in Baadgir first. Off by default; turn them on in Settings.
-- Advanced mode (off by default) shows Manual: a live speed slider with editable, remembered minimum and maximum RPM limits. Turning Advanced off ends a running Manual session.
-- One administrator prompt per session; speed and mode changes inside a session need no new prompt.
-- Automatic-control restoration attempted on Auto, quit, sleep, app crash or freeze, and monitoring failure.
-- Auto also releases fans left in manual mode by a crashed session or another app.
+<p align="center">
+  <img src="assets/cover.png" alt="Baadgir on a Mac: CPU temperature and fan speed in the menu bar, the popover with CPU, GPU, battery and SSD temperatures, 10-minute temperature and fan graphs and Auto, Curve and Max modes, and the Settings window with the custom fan curve editor, next to a list of features">
+</p>
 
-## Build and run
+## Why Baadgir?
 
-Requires an Apple silicon Mac, macOS 13+, and Xcode Command Line Tools.
+macOS keeps the fans quiet until your Mac is already hot. That's fine for email, but during a long export, build or game your MacBook Pro can throttle before the fans catch up. Baadgir lets you cool it down earlier, and hands control back to macOS when you're done.
 
-Works on M1 through M5 chips, using each generation's own sensor keys; a newer chip probes every known key to show temperatures, but offers only Auto and Max until its sensor keys are added, since Manual and Curve rely on them. Macs with two fans (14" and 16" MacBook Pro) are controlled together within the speed range both fans support. Fanless Macs, such as the MacBook Air, show temperatures only. `baadgir status` prints the chip, fans, and sensor keys it found.
+- 🌡️ **Live temperatures in the menu bar.** CPU, GPU, battery and SSD readings, colored green, yellow or red, plus fan RPM, power draw and thermal pressure.
+- 📈 **10-minute history graphs** of temperature and fan speed, right in the popover.
+- 🌀 **Custom fan curve.** Set four temperature → RPM points. Baadgir only speeds the fans up, never runs them slower than macOS would, and enforces a safe minimum.
+- 🚀 **One-click Max.** Full fan speed from the popover, the right-click menu, or <kbd>⌃</kbd><kbd>⌥</kbd><kbd>M</kbd> from any app.
+- ⚡ **Automation.** Switch to Curve or Max when you plug in, back to Auto on battery. Also works with Shortcuts, `baadgir://` links and a command-line tool.
+- 🛡️ **Safety first.** Fans go back to macOS automatic control on quit, sleep, a crash, overheating or a sensor failure.
+- 🔒 **Private and lightweight.** Native Swift and SwiftUI with no dependencies, no network access, no analytics and no logs.
 
-```sh
-./test.sh
-./build.sh --install   # builds, installs the root-owned fan-control helper (asks for your password), replaces /Applications/Baadgir.app, and opens it
-```
+## Fan modes
 
-`./build.sh` alone builds `Baadgir.app` here without installing it. Only one copy runs at a time; a second launch quits immediately.
+| Mode | What it does |
+| --- | --- |
+| **Auto** | macOS controls the fans, as usual. |
+| **Curve** | Your temperature → RPM curve, used only when it wants more cooling than macOS. |
+| **Max** | Fans at full speed until you choose Auto. |
+| **Manual** | A fixed speed you pick. Hidden behind Settings → Fans → Advanced. |
 
-Fan control requires macOS administrator authorization and the helper that `--install` puts at `/Library/PrivilegedHelperTools/local.baadgir.helper`. Monitoring needs neither. To uninstall, choose Auto and quit Baadgir, delete the app, and run `sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baadgir.lock`.
+## Install
 
-### Shortcuts and the command line
-
-First turn on Settings → Automation → Shortcuts, links, and command line. Any web page or app can open a link, so leave it off if you don't use it. A request that would start Curve, Manual, or Max shows a Baadgir confirmation before macOS asks for your password. A request for Manual is refused unless Advanced is on, and is always confirmed, even during a running session, since it can run the fans slower than macOS would; switching to Max or Curve during a running session, or returning to Auto, is not. In Shortcuts, add an **Open URLs** action with a link such as `baadgir://max`. For the terminal, link the executable onto your `PATH`:
+You need an Apple silicon Mac (M1 to M5), macOS 13 or later, and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```sh
-ln -s /Applications/Baadgir.app/Contents/MacOS/baadgir /usr/local/bin/baadgir
-baadgir status        # read-only readings
-baadgir manual 3000   # asks the running app; it launches the installed copy if needed
+git clone https://github.com/devbymak/baadgir.git
+cd baadgir
+./build.sh --install
 ```
+
+This builds the app, installs a small root-owned fan-control helper (macOS asks for your password once), and copies Baadgir to `/Applications`. Temperature monitoring alone needs no password.
+
+**Supported Macs:** Apple silicon Macs with fans, including two-fan 14" and 16" MacBook Pro models (both fans move together). On a fanless MacBook Air, Baadgir shows temperatures only. Run `baadgir status` to see the chip, fans and sensors it found.
+
+<details>
+<summary><b>Shortcuts, links and command line</b></summary>
+
+Turn on Settings → Automation → Shortcuts, links, and command line first. It's off by default because any app or web page can open a link. Baadgir still asks for confirmation before it starts cooling or sets a manual speed.
+
+- **Shortcuts:** add an *Open URLs* action with `baadgir://auto`, `baadgir://curve`, `baadgir://max` or `baadgir://manual?rpm=3000`.
+- **Terminal:**
+
+  ```sh
+  ln -s /Applications/Baadgir.app/Contents/MacOS/baadgir /usr/local/bin/baadgir
+  baadgir status        # read-only readings
+  baadgir max           # or auto, curve, manual 3000
+  ```
+
+</details>
+
+<details>
+<summary><b>Uninstall</b></summary>
+
+Choose Auto, quit Baadgir, delete the app, then run:
+
+```sh
+sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baadgir.lock
+```
+
+</details>
 
 ## Safety
 
-Experimental: uses an undocumented SMC interface. Hardware control and restoration have not been verified on the target M5 MacBook Pro. Use at your own risk.
+> [!WARNING]
+> Baadgir is experimental. It uses Apple's undocumented SMC interface, and fan control has not been verified on every Mac. Use it at your own risk.
 
-Manual is hidden unless Settings → Fans → Advanced is on, since it can run the fans below the safe minimum. Manual speed stays within the reported hardware range, with a floor of 1000 RPM. CPU and GPU readings are required. Manual speed starts below 75°C and returns to Auto at 80°C, high thermal pressure, or sensor failure; a detected battery temperature of 45°C or SSD temperature of 70°C also ends manual control. Max has no temperature cutoff because it never lowers fan speed. Curve mode never runs below the safe minimum for the current temperature, which the root helper applies on every update, switches to maximum at 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, eases speed down by at most 100 RPM per step, and hands the fans back to macOS once the curve stays at or below macOS's speed (or the fans' minimum, if macOS had stopped them) for 10 seconds. The root helper returns fans to Auto if the app stops refreshing its target for 10 seconds, and its watchdog stops the helper and restores Auto if the helper itself stalls for 15 seconds; that restore needs only each fan's mode, not its other readings. Manual and Curve need a chip whose sensor keys Baadgir knows. These are conservative software cutoffs, not certified safety limits. Your min/max settings only constrain manual speed; automatic cooling can exceed them.
+<details>
+<summary><b>How Baadgir keeps your Mac safe</b></summary>
 
-Root only ever runs the root-owned helper, never the app bundle, which apps running as you could replace; the app checks the helper is root-owned and matches its own build before asking for your password. The helper runs with an empty environment and reads its controls only from a private folder owned by the app's user. The app does not disable Apple's thermal services. A separate root watchdog restores Auto if the helper is force-killed; killing both, or failed hardware writes, can prevent cleanup. Restart your Mac if automatic control cannot be restored. Avoid running other fan-control apps alongside Baadgir.
+- **Curve** never runs below a safe minimum for the current temperature (the fans' minimum up to 65°C, a quarter of their range at 72°C, half at 78°C). It switches to full speed at 80°C CPU/GPU, a 45°C battery, a 70°C SSD or high thermal pressure, and returns to Auto once macOS's own speed is enough.
+- **Manual** only starts below 75°C, never goes under 1000 RPM, and returns to Auto at 80°C, a hot battery or SSD, high thermal pressure or a sensor failure.
+- **Max** has no cutoff because it never lowers fan speed.
+- **Watchdogs:** the root helper restores Auto if the app stops responding for 10 seconds, and a separate watchdog restores Auto if the helper itself stalls for 15 seconds.
+- **Least privilege:** only a root-owned helper runs as root, never the app bundle, and the app checks that helper before asking for your password. Apple's thermal services are never disabled.
+
+These are conservative software limits, not certified safety limits. If automatic control can't be restored, restart your Mac. Don't run other fan-control apps at the same time.
+
+</details>
+
+## FAQ
+
+**Is Baadgir free?** Yes. It's open source under the MIT license.
+
+**Does it work on M4 and M5 Macs?** Yes, M1 through M5 are supported. A newer chip still shows temperatures and offers Auto and Max until its sensors are added.
+
+**Will it drain my battery?** Baadgir is a small native app that reads sensors once a second. The helper runs only while you use Curve, Max or Manual, and you can make it return to Auto on battery.
+
+**Why the name?** *Baadgir* (بادگیر) means "windcatcher": the Persian towers that have cooled buildings by catching the wind for centuries.
+
+## Credits
 
 Sensor-key reference: [Stats](https://github.com/exelban/stats/blob/master/Modules/Sensors/values.swift).
 
 ## License
 
-MIT — see [license](license).
+MIT. See [license](license).
