@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import IOKit
 import Darwin
+import ServiceManagement
 
 struct Fan {
     let index: Int
@@ -366,6 +367,17 @@ final class CoolingModel: ObservableObject {
         guard colorsTemperatures, let value else { return nil }
         return reading.level(value).raised(by: thermalLevel())
     }
+    /// Mirrors the login item's registration; System Settings can change it behind our back.
+    @Published private(set) var loginItemStatus = SMAppService.mainApp.status
+    @Published private(set) var loginItemError: String?
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            loginItemError = nil
+        } catch { loginItemError = "Cannot change Launch at Login: \(error.localizedDescription)" }
+        loginItemStatus = SMAppService.mainApp.status
+    }
+    func refreshLoginItemStatus() { loginItemStatus = SMAppService.mainApp.status }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
     private let queue = DispatchQueue(label: "local.baadgir.sensors")
@@ -704,6 +716,23 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
+                Toggle("Launch at login", isOn: Binding(
+                    get: { [.enabled, .requiresApproval].contains(model.loginItemStatus) },
+                    set: { model.setLaunchAtLogin($0) }))
+                if model.loginItemStatus == .requiresApproval {
+                    HStack {
+                        Text("Allow Baadgir in Login Items to finish.").font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
+                if let error = model.loginItemError {
+                    Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("General")
+            }
+            Section {
                 ForEach(TemperatureReading.allCases, id: \.self) { reading in
                     Toggle(reading.title, isOn: Binding(get: { model.menuBarReadings.contains(reading) },
                                                         set: { _ in model.toggleMenuBar(reading) }))
@@ -734,6 +763,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 440)
+        .onAppear { model.refreshLoginItemStatus() }
         .fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -907,6 +937,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsWindow: NSWindow?
     @objc func openSettings() {
         popover.performClose(nil)
+        model.refreshLoginItemStatus()
         if settingsWindow == nil {
             let host = NSHostingController(rootView: SettingsView(model: model))
             host.sizingOptions = .preferredContentSize
