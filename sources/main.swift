@@ -192,26 +192,30 @@ func coolingSession(parent: pid_t, directory: String) throws {
         guard heartbeat.isFresh(stamp: modified, now: ProcessInfo.processInfo.systemUptime) else {
             throw Failure("Baadgir stopped responding; returning to automatic cooling")
         }
-        if case .manual(let rpm) = target {
+        switch target {
+        case .manual(let rpm):
             try CoolingPolicy.validateRange(rpm: rpm, minimum: bounds.minimum, maximum: bounds.maximum, hardware: bounds)
+        case .curve(let curve): try curve.validate(hardware: bounds)
+        case .maximum: break
         }
         return target
-    }
-    func rpm(for fan: Fan, _ target: CoolingTarget) -> Float {
-        if case .manual(let rpm) = target { return Float(rpm) }
-        return fan.maximum
     }
     // The first target must also be recent by wall clock; later checks use the monotonic heartbeat.
     guard abs(Date().timeIntervalSince1970 - (try readControl(controlPath)).modified) <= CoolingPolicy.heartbeatTimeout else {
         throw Failure("Cooling controls are stale")
     }
-    if case .manual = try requestedTarget() {
-        try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: true)
+    switch try requestedTarget() {
+    case .manual: try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: true)
+    case .curve: _ = try smc.temperatures()
+    case .maximum: break
     }
     signal(SIGTERM, handleSignal); signal(SIGINT, handleSignal); signal(SIGHUP, handleSignal)
     // Started before any fan is touched; it restores Auto even if this process is force-killed.
     let watchdog = try startWatchdog(executable: Bundle.main.executablePath ?? CommandLine.arguments[0])
     defer { close(watchdog) }
+    // Tells the app the session is live; in Curve mode the fans may stay automatic for a long time.
+    let marker = open(directory + "/running", O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o644)
+    if marker >= 0 { close(marker) }
     var touched: [Fan] = []
     func restore() -> Bool {
         AutomaticRestoration.restore(keys: touched.map(\.modeKey),
@@ -219,19 +223,23 @@ func coolingSession(parent: pid_t, directory: String) throws {
             writeAutomatic: { try smc.write($0, expectedType: "ui8 ", bytes: [0]) },
             retryDelay: { usleep(100_000) })
     }
-    do {
-        guard !cancelled() else { throw Failure("Cooling session was cancelled") }
-        for fan in fans {
-            // Start at maximum to avoid entering manual mode with a stale low target.
-            touched.append(fan)
-            try smc.target(fan)
+    /// Per-fan targets while Baadgir holds the fans; nil while macOS controls them (Curve mode only).
+    var applied: [Float]?
+    /// Puts every fan in manual mode, writing the target first so no fan runs a stale value.
+    func engage(_ targets: [Float]) throws {
+        for (fan, rpm) in zip(fans, targets) {
+            if !touched.contains(where: { $0.index == fan.index }) { touched.append(fan) }
+            try smc.target(fan, rpm: rpm)
             try smc.mode(fan, 1)
-            guard try smc.number(fan.modeKey) == 1,
-                  abs(try smc.number("F\(fan.index)Tg") - fan.maximum) <= 1 else {
-                throw Failure("Fan controller did not confirm maximum cooling")
+            guard try smc.number(fan.modeKey) == 1, abs(try smc.number("F\(fan.index)Tg") - rpm) <= 1 else {
+                throw Failure("Fan controller did not confirm the requested speed")
             }
         }
-        var applied = CoolingTarget.maximum
+        applied = targets
+    }
+    var curveController = CurveController()
+    do {
+        guard !cancelled() else { throw Failure("Cooling session was cancelled") }
         let clock = ContinuousClock()
         var previous = clock.now
         var changed = previous
@@ -241,19 +249,51 @@ func coolingSession(parent: pid_t, directory: String) throws {
             if previous.duration(to: now) > .seconds(3) || cancelled() { break }
             previous = now
             let target = try requestedTarget()
-            if case .manual = target {
+            let wanted: [Float]?
+            switch target {
+            case .maximum:
+                wanted = fans.map(\.maximum)
+            case .manual(let rpm):
                 try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: false)
+                wanted = fans.map { _ in Float(rpm) }
+            case .curve(let curve):
+                if !curveController.engaged, applied != nil {
+                    // Coming from Manual or Max: hand the fans back so the curve starts from macOS's own speed.
+                    guard restore() else { throw Failure("Automatic control could not be verified. Restart your Mac.") }
+                    applied = nil
+                    usleep(500_000); continue
+                }
+                let desired = CoolingPolicy.curveSpeed(curve, try smc.temperatures(), thermal: thermalLevel())
+                wanted = curveController.targets(desired: desired, actual: try smc.fans().map { Double($0.rpm) },
+                    maximums: fans.map { Double($0.maximum) }, now: ProcessInfo.processInfo.systemUptime)?.map(Float.init)
             }
-            if target != applied {
-                for fan in fans { try smc.target(fan, rpm: rpm(for: fan, target)) }
-                applied = target; changed = now
+            if case .curve = target {} else { curveController = CurveController() }
+            if let wanted {
+                if applied == nil {
+                    // Manual and Max start at maximum, never a stale low target; Curve starts above macOS's speed.
+                    if case .curve = target { try engage(wanted) } else { try engage(fans.map(\.maximum)) }
+                    changed = now
+                }
+                if wanted != applied {
+                    for (fan, rpm) in zip(fans, wanted) { try smc.target(fan, rpm: rpm) }
+                    applied = wanted; changed = now
+                }
+            } else if applied != nil {
+                guard restore() else { throw Failure("Automatic control could not be verified. Restart your Mac.") }
+                applied = nil
             }
             let live = try smc.fans()
             guard live.count == fans.count else { throw Failure("Fan configuration changed") }
-            for (fan, original) in zip(live, fans) {
-                let expected = rpm(for: original, applied)
-                guard fan.minimum == original.minimum, fan.maximum == original.maximum,
-                      fan.mode == 1, abs(try smc.number("F\(fan.index)Tg") - expected) <= 1 else {
+            for (index, (fan, original)) in zip(live, fans).enumerated() {
+                guard fan.minimum == original.minimum, fan.maximum == original.maximum else {
+                    throw Failure("Fan configuration changed")
+                }
+                guard let applied else {
+                    guard fan.mode != 1 else { throw Failure("Another app took control of a fan; session ended") }
+                    continue
+                }
+                let expected = applied[index]
+                guard fan.mode == 1, abs(try smc.number("F\(fan.index)Tg") - expected) <= 1 else {
                     throw Failure("System reclaimed fan control; session ended")
                 }
                 if changed.duration(to: now) > .seconds(5), fan.rpm < max(300, expected * 0.35) {
@@ -327,7 +367,7 @@ func restoreAutomatic() throws {
     }
 }
 
-enum FanMode: Hashable { case auto, manual, maximum }
+enum FanMode: Hashable { case auto, curve, manual, maximum }
 
 final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
@@ -378,6 +418,36 @@ final class CoolingModel: ObservableObject {
         loginItemStatus = SMAppService.mainApp.status
     }
     func refreshLoginItemStatus() { loginItemStatus = SMAppService.mainApp.status }
+    /// Curve points as typed in Settings; `curve` is the last valid version, which is what runs.
+    @Published var curveTemperatureTexts = [String](repeating: "", count: FanCurve.pointCount) { didSet { curveChanged() } }
+    @Published var curveRPMTexts = [String](repeating: "", count: FanCurve.pointCount) { didSet { curveChanged() } }
+    @Published private(set) var curve: FanCurve?
+    @Published private(set) var curveError: String?
+    private var fillingCurve = false
+    private func curveChanged() {
+        guard initializedLimits, !fillingCurve, let bounds else { return }
+        do {
+            let temperatures = curveTemperatureTexts.map { Double($0) }, speeds = curveRPMTexts.map { Double($0) }
+            guard !temperatures.contains(nil), !speeds.contains(nil) else { throw Failure("Enter a number in every field") }
+            let edited = try FanCurve(zip(temperatures, speeds).map { FanCurve.Point(temperature: $0!, rpm: $1!) })
+            try edited.validate(hardware: bounds)
+            curve = edited; curveError = nil
+            defaults.set(edited.points.flatMap { [Int($0.temperature), Int($0.rpm)] }, forKey: "curvePoints")
+        } catch { curveError = String(describing: error) }
+    }
+    private func showCurve(_ curve: FanCurve) {
+        fillingCurve = true  // Fill every field before validating.
+        curveTemperatureTexts = curve.points.map { String(Int($0.temperature)) }
+        curveRPMTexts = curve.points.map { String(Int($0.rpm)) }
+        fillingCurve = false
+        curveChanged()
+    }
+    func resetCurve() { if let bounds { showCurve(.standard(for: bounds)) } }
+    /// What the curve asks for right now; infinity means maximum.
+    var curveSpeedNow: Double? {
+        guard let curve, let temperatures else { return nil }
+        return CoolingPolicy.curveSpeed(curve, temperatures, thermal: thermalLevel())
+    }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
     private let queue = DispatchQueue(label: "local.baadgir.sensors")
@@ -413,6 +483,10 @@ final class CoolingModel: ObservableObject {
         if externallyControlled { return "A fan is stuck in manual mode" }
         guard sessionRunning else { return "Automatic cooling" }
         if mode == .maximum { return "Maximum cooling" }
+        if mode == .curve {
+            guard let fan = fans.first(where: { $0.mode == 1 }) else { return "Curve · following macOS" }
+            return "Curve · \(Int(fan.rpm.rounded()).formatted()) RPM"
+        }
         return "Manual · \(Int(selectedRPM.rounded()).formatted()) RPM"
     }
     var thermalText: String {
@@ -445,6 +519,12 @@ final class CoolingModel: ObservableObject {
         selectedRPM = Double(defaults.object(forKey: "manualRPM") as? Int ?? upper)
         limitsChanged()
         initializedLimits = true
+        let saved = (defaults.array(forKey: "curvePoints") as? [Int]) ?? []
+        let points = stride(from: 0, to: saved.count - 1, by: 2).map {
+            FanCurve.Point(temperature: Double(saved[$0]), rpm: Double(saved[$0 + 1]))
+        }
+        if let stored = try? FanCurve(points), (try? stored.validate(hardware: bounds)) != nil { showCurve(stored) }
+        else { showCurve(.standard(for: bounds)) }
     }
     func refresh() {
         heartbeat()
@@ -469,11 +549,13 @@ final class CoolingModel: ObservableObject {
                 self.fans = fans; self.temperatures = temperatures; self.sensorError = errorMessage
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
                 if !self.initializedLimits, let bounds = self.bounds { self.loadLimits(bounds) }
-                if self.sessionRunning, self.pending != nil, self.stopRequested == false,
-                   fans.contains(where: { $0.mode == 1 }) { self.pending = nil }
+                if self.sessionRunning, self.pending != nil, self.stopRequested == false, let directory = self.directory,
+                   FileManager.default.fileExists(atPath: directory.appendingPathComponent("running").path) {
+                    self.pending = nil
+                }
                 // The helper performs its own independent sensor checks as well.
                 // Maximum cooling can run without temperatures; its RPM is never reduced.
-                if self.sessionRunning && self.mode == .manual && temperatures == nil { self.endSession() }
+                if self.sessionRunning && [.manual, .curve].contains(self.mode) && temperatures == nil { self.endSession() }
                 self.onUpdate?()
             }
         }
@@ -487,6 +569,11 @@ final class CoolingModel: ObservableObject {
         case .auto:
             if sessionRunning { endSession() }
             else if externallyControlled { restoreAutomaticControl() }
+        case .curve:
+            if let reason = curveBlocker() { message = reason; break }
+            if sessionRunning { mode = .curve; heartbeat() }
+            else if externallyControlled { message = "Choose Auto to release the fans first." }
+            else { startSession(.curve) }
         case .manual:
             if let reason = manualBlocker() { message = reason; break }
             if sessionRunning { mode = .manual; heartbeat() }
@@ -499,6 +586,11 @@ final class CoolingModel: ObservableObject {
             else { startSession(.maximum) }
         }
         onUpdate?()
+    }
+    private func curveBlocker() -> String? {
+        guard curve != nil else { return curveError ?? "Set up a fan curve in Settings first." }
+        guard temperatures != nil else { return "Temperature readings are unavailable; keeping automatic cooling" }
+        return nil
     }
     private func manualBlocker() -> String? {
         guard let bounds, let minimum, let maximum else { return "Fan limits are unavailable." }
@@ -515,7 +607,14 @@ final class CoolingModel: ObservableObject {
     /// Writes the current target. Rewritten every second so the helper knows the app is alive.
     func heartbeat() {
         guard sessionRunning, !stopRequested, let directory else { return }
-        let target = mode == .maximum ? CoolingTarget.maximum : .manual(rpm: selectedRPM.rounded())
+        let target: CoolingTarget
+        switch mode {
+        case .maximum, .auto: target = .maximum
+        case .manual: target = .manual(rpm: selectedRPM.rounded())
+        case .curve:
+            guard let curve else { return }
+            target = .curve(curve)
+        }
         do { try target.encoded.write(to: directory.appendingPathComponent("control"), atomically: true, encoding: .utf8) }
         catch { message = "Cannot update fan speed: \(error.localizedDescription)" }
     }
@@ -637,12 +736,18 @@ struct ControlsView: View {
             Divider()
             Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.select($0) })) {
                 Text("Auto").tag(FanMode.auto)
+                Text("Curve").tag(FanMode.curve)
                 Text("Manual").tag(FanMode.manual)
                 Text("Max").tag(FanMode.maximum)
             }
             .pickerStyle(.segmented).labelsHidden()
             .disabled(model.pending != nil || model.fans.isEmpty)
             if model.showsManualControls { manualControls }
+            if model.sessionRunning && model.mode == .curve, let speed = model.curveSpeedNow {
+                Text(speed.isInfinite ? "Curve wants maximum cooling"
+                                      : "Curve wants \(Int(speed).formatted()) RPM at \(Int(model.temperatures?.highest ?? 0))°C")
+                    .font(.caption).monospacedDigit()
+            }
             Text(explanation).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
@@ -683,7 +788,9 @@ struct ControlsView: View {
         case .auto where model.externallyControlled:
             return "Choose Auto to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. Manual and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
+            return "macOS controls the fans. Curve, Manual and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
+        case .curve:
+            return "Follows your curve from Settings when it asks for more than macOS, never less. Maximum at 80°C or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
         case .manual:
             return "Drag to change speed. Returns to Auto at 80°C, high thermal pressure, sleep, quit, or if monitoring fails."
         case .maximum:
@@ -760,11 +867,64 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             .disabled(model.bounds == nil)
+            Section {
+                ForEach(0..<FanCurve.pointCount, id: \.self) { index in
+                    HStack {
+                        Text("Point \(index + 1)")
+                        Spacer()
+                        TextField("°C", text: $model.curveTemperatureTexts[index]).frame(width: 50)
+                        Text("°C").foregroundStyle(.secondary)
+                        TextField("RPM", text: $model.curveRPMTexts[index]).frame(width: 64)
+                        Text("RPM").foregroundStyle(.secondary)
+                    }
+                    .labelsHidden().multilineTextAlignment(.trailing)
+                }
+                if let error = model.curveError {
+                    Text(error).font(.caption).foregroundStyle(.orange)
+                }
+                if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
+                HStack { Spacer(); Button("Reset to Default") { model.resetCurve() } }
+            } header: {
+                Text("Fan Curve")
+            } footer: {
+                Text("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery or high thermal pressure, fans run at maximum.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .disabled(model.bounds == nil)
         }
         .formStyle(.grouped)
         .frame(width: 440)
         .onAppear { model.refreshLoginItemStatus() }
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Small line drawing of the curve from 30°C to 80°C, where maximum takes over.
+struct CurvePreview: View {
+    let curve: FanCurve
+    let bounds: HardwareBounds
+    private let low = FanCurve.lowestTemperature, high = CoolingPolicy.stopLimit
+    private func point(_ temperature: Double, _ rpm: Double, in size: CGSize) -> CGPoint {
+        CGPoint(x: (temperature - low) / (high - low) * size.width,
+                y: (1 - (rpm - bounds.minimum) / (bounds.maximum - bounds.minimum)) * size.height)
+    }
+    var body: some View {
+        GeometryReader { geometry in
+            Path { path in
+                path.move(to: point(low, curve.rpm(at: low), in: geometry.size))
+                for item in curve.points { path.addLine(to: point(item.temperature, item.rpm, in: geometry.size)) }
+                path.addLine(to: point(high - 0.001, curve.points.last!.rpm, in: geometry.size))
+                path.addLine(to: point(high, bounds.maximum, in: geometry.size))
+            }
+            .stroke(Color.accentColor, lineWidth: 2)
+            ForEach(curve.points, id: \.temperature) { item in
+                Circle().fill(Color.accentColor).frame(width: 6, height: 6)
+                    .position(point(item.temperature, item.rpm, in: geometry.size))
+            }
+        }
+        .frame(height: 70)
+        .padding(.vertical, 4)
+        .accessibilityLabel("Fan curve preview")
     }
 }
 
@@ -893,6 +1053,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let busy = model.pending != nil || model.fans.isEmpty
         for (title, mode) in [("Auto", FanMode.auto),
+                              ("Curve", .curve),
                               ("Manual · \(Int(model.selectedRPM.rounded()).formatted()) RPM", .manual),
                               ("Max", .maximum)] {
             let entry = NSMenuItem(title: title, action: busy ? nil : #selector(selectMode(_:)), keyEquivalent: "")
@@ -945,6 +1106,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.title = "Baadgir Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
+            // Size to the SwiftUI content first; centering the default-sized window leaves it off-center once it grows.
+            window.setContentSize(host.view.fittingSize)
             window.center()
             settingsWindow = window
         }

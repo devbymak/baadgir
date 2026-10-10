@@ -118,4 +118,47 @@ check(TemperatureReading.ssd.value(in: withSSD) == 48 && withSSD.highest == 50, 
 rejects("Invalid SSD sensor") { _ = try Temperatures(cpu: [50], gpu: [50], ssd: [.nan]) }
 check(TemperatureReading.hottest.value(in: normal) == 60 && TemperatureReading.battery.value(in: warm) == nil,
       "Menu bar reading selection")
+func points(_ values: [(Double, Double)]) -> [FanCurve.Point] {
+    values.map { FanCurve.Point(temperature: $0.0, rpm: $0.1) }
+}
+let curve = try FanCurve(points([(50, 2000), (60, 3000), (70, 4000), (78, 5000)]))
+check(curve.rpm(at: 40) == 2000 && curve.rpm(at: 55) == 2500 && curve.rpm(at: 79) == 5000, "Curve interpolation")
+try curve.validate(hardware: hardware)
+checks += 1
+rejects("Curve below hardware minimum") {
+    try FanCurve(points([(50, 1000), (60, 3000), (70, 4000), (78, 5000)])).validate(hardware: hardware)
+}
+for bad in [[(50.0, 2000.0), (50, 3000), (70, 4000), (78, 5000)], [(50, 3000), (60, 2000), (70, 4000), (78, 5000)],
+            [(20, 2000), (60, 3000), (70, 4000), (78, 5000)], [(50, 2000), (60, 3000), (70, 4000), (80, 5000)],
+            [(50, 2000), (60, 3000), (70, 4000)], [(50, .nan), (60, 3000), (70, 4000), (78, 5000)]] {
+    rejects("Malformed curve \(bad)") { _ = try FanCurve(points(bad)) }
+}
+let standard = FanCurve.standard(for: hardware)
+try standard.validate(hardware: hardware)
+check(standard.points.first!.rpm == 1500 && standard.points.last!.rpm == 5500, "Default curve spans the hardware range")
+try check(try CoolingTarget(encoded: CoolingTarget.curve(curve).encoded) == .curve(curve), "Curve target round trip")
+check(CoolingTarget.curve(curve).encoded.utf8.count <= 64, "Curve target fits the control file")
+rejects("Curve target with missing speed") { _ = try CoolingTarget(encoded: "curve 50 2000 60 3000 70 4000 78") }
+rejects("Curve target with text") { _ = try CoolingTarget(encoded: "curve 50 2000 60 3000 70 4000 78 fast") }
+let cool = try Temperatures(cpu: [55], gpu: [40])
+check(CoolingPolicy.curveSpeed(curve, cool, thermal: .nominal) == 2500, "Curve follows the hottest CPU/GPU sensor")
+check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal) == .infinity, "Curve runs maximum at the stop limit")
+check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious) == .infinity, "Curve runs maximum under thermal pressure")
+check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal) == .infinity, "Curve runs maximum with a hot battery")
+var controller = CurveController()
+check(controller.targets(desired: 2500, actual: [2300], maximums: [6000], now: 0) == nil,
+      "Curve leaves fans with macOS unless it clearly wants more")
+check(controller.targets(desired: 3000, actual: [2300], maximums: [6000], now: 1) == [3000], "Curve takes over above macOS")
+check(controller.targets(desired: 2000, actual: [3000], maximums: [6000], now: 2) == [2900], "Speed drops gradually")
+check(controller.targets(desired: 2000, actual: [3000], maximums: [6000], now: 3) == [2800], "Speed keeps dropping gradually")
+for step in 4...30 { _ = controller.targets(desired: 2000, actual: [2300], maximums: [6000], now: Double(step) * 0.1 + 3) }
+check(controller.applied == [2300], "Never below the speed macOS had chosen")
+check(controller.targets(desired: 2000, actual: [2300], maximums: [6000], now: 12.5) == nil && !controller.engaged,
+      "Hand fans back to macOS once the curve stays at or below its speed")
+check(controller.targets(desired: .infinity, actual: [2300, 2500], maximums: [6000, 5800], now: 20) == [6000, 5800],
+      "Maximum respects each fan's own limit")
+check(controller.targets(desired: 3000, actual: [6000, 5800], maximums: [6000, 5800], now: 21) == [5900, 5700],
+      "Leaving maximum also ramps down")
+check(controller.targets(desired: 5950, actual: [3000, 3000], maximums: [6000, 5800], now: 21.5) == [5950, 5800],
+      "Rising curve applies immediately")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")

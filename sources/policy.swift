@@ -97,23 +97,118 @@ enum TemperatureReading: String, CaseIterable {
     }
 }
 
+/// Temperature → RPM points, interpolated linearly. Flat before the first and after the last point.
+struct FanCurve: Equatable {
+    struct Point: Equatable {
+        var temperature: Double
+        var rpm: Double
+    }
+    static let pointCount = 4
+    /// Lowest temperature a point may use.
+    static let lowestTemperature = 30.0
+    let points: [Point]
+    /// Checks the shape only; `validate(hardware:)` checks the speeds against the fans.
+    init(_ points: [Point]) throws {
+        guard points.count == Self.pointCount,
+              points.allSatisfy({ $0.temperature.isFinite && $0.rpm.isFinite }),
+              points.first!.temperature >= Self.lowestTemperature,
+              points.last!.temperature < CoolingPolicy.stopLimit else {
+            throw Failure("Curve temperatures must be between \(Int(Self.lowestTemperature))°C and \(Int(CoolingPolicy.stopLimit) - 1)°C")
+        }
+        guard zip(points, points.dropFirst()).allSatisfy({ $0.temperature < $1.temperature }) else {
+            throw Failure("Curve temperatures must increase from point to point")
+        }
+        guard zip(points, points.dropFirst()).allSatisfy({ $0.rpm <= $1.rpm }) else {
+            throw Failure("Curve speeds must not decrease as temperature rises")
+        }
+        self.points = points
+    }
+    func validate(hardware: HardwareBounds) throws {
+        guard points.allSatisfy({ $0.rpm >= hardware.minimum && $0.rpm <= hardware.maximum }) else {
+            throw Failure("Curve speeds must be within \(Int(ceil(hardware.minimum)))–\(Int(floor(hardware.maximum))) RPM")
+        }
+    }
+    /// A gentle default spread across the hardware range.
+    static func standard(for hardware: HardwareBounds) -> FanCurve {
+        let low = ceil(hardware.minimum), high = floor(hardware.maximum)
+        let speeds = [0.0, 0.3, 0.65, 1].map { ((low + (high - low) * $0) / 50).rounded(.down) * 50 }
+        return try! FanCurve(zip([55.0, 65, 72, 78], speeds).map { Point(temperature: $0, rpm: max(low, $1)) })
+    }
+    func rpm(at temperature: Double) -> Double {
+        guard temperature > points.first!.temperature else { return points.first!.rpm }
+        for (a, b) in zip(points, points.dropFirst()) where temperature <= b.temperature {
+            return a.rpm + (b.rpm - a.rpm) * (temperature - a.temperature) / (b.temperature - a.temperature)
+        }
+        return points.last!.rpm
+    }
+}
+
 /// What the helper should hold the fans at. The app rewrites it every second as a heartbeat.
 enum CoolingTarget: Equatable {
     case manual(rpm: Double)
     case maximum
+    case curve(FanCurve)
     var encoded: String {
         switch self {
         case .manual(let rpm): return "manual \(Int(rpm.rounded()))\n"
         case .maximum: return "maximum\n"
+        case .curve(let curve):
+            return "curve " + curve.points.map { "\(Int($0.temperature.rounded())) \(Int($0.rpm.rounded()))" }
+                .joined(separator: " ") + "\n"
         }
     }
     init(encoded text: String) throws {
         let parts = text.split(whereSeparator: \.isWhitespace).map(String.init)
         if parts == ["maximum"] { self = .maximum; return }
+        if parts.first == "curve" {
+            let numbers = parts.dropFirst().compactMap(Double.init)
+            guard numbers.count == parts.count - 1, numbers.count == FanCurve.pointCount * 2 else {
+                throw Failure("Invalid cooling target")
+            }
+            self = .curve(try FanCurve(stride(from: 0, to: numbers.count, by: 2).map {
+                FanCurve.Point(temperature: numbers[$0], rpm: numbers[$0 + 1])
+            }))
+            return
+        }
         guard parts.count == 2, parts[0] == "manual", let rpm = Double(parts[1]), rpm.isFinite else {
             throw Failure("Invalid cooling target")
         }
         self = .manual(rpm: rpm)
+    }
+}
+
+/// Runs Curve mode on top of macOS: fans stay automatic until the curve asks for clearly more than
+/// macOS is doing, and while held they never drop below the speed macOS had chosen.
+struct CurveController {
+    /// Curve must exceed the fans' actual speed by this much before Baadgir takes over.
+    static let engageMargin = 300.0
+    /// How long the curve must sit at or below macOS's speed before handing the fans back.
+    static let releaseDelay = 10.0
+    /// Largest speed drop per update, so falling temperatures don't make fans hunt.
+    static let rampDown = 100.0
+    /// macOS's per-fan speeds when Baadgir took over; nil while macOS controls the fans.
+    private(set) var floors: [Double]?
+    private(set) var applied: [Double]?
+    private var belowSince: Double?
+    var engaged: Bool { floors != nil }
+    /// Per-fan targets, or nil to leave the fans with macOS. `now` is monotonic seconds.
+    mutating func targets(desired: Double, actual: [Double], maximums: [Double], now: Double) -> [Double]? {
+        guard let floors, let applied else {
+            guard desired >= (actual.max() ?? .infinity) + Self.engageMargin else { return nil }
+            floors = actual; belowSince = nil
+            applied = zip(actual, maximums).map { min(max(desired, $0), $1) }
+            return applied
+        }
+        if desired <= floors.max()! {
+            belowSince = belowSince ?? now
+            if now - belowSince! >= Self.releaseDelay {
+                self.floors = nil; self.applied = nil; belowSince = nil
+                return nil
+            }
+        } else { belowSince = nil }
+        let wanted = zip(floors, maximums).map { min(max(desired, $0), $1) }
+        self.applied = zip(wanted, applied).map { $0 >= $1 ? $0 : max($0, $1 - Self.rampDown) }
+        return self.applied
     }
 }
 
@@ -135,6 +230,12 @@ struct CoolingPolicy {
     // Conservative software cutoffs, not manufacturer-certified limits.
     static let startLimit = 75.0
     static let stopLimit = 80.0
+    /// Curve speed for the current readings; infinity (all fans at maximum) when it's hot.
+    static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, thermal: ThermalLevel) -> Double {
+        guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
+              temperatures.battery.map({ $0 < 45 }) ?? true else { return .infinity }
+        return (curve.rpm(at: temperatures.highest) / 50).rounded() * 50
+    }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
         guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,
               maximum <= hardware.maximum, minimum < maximum else {
