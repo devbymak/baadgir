@@ -72,6 +72,13 @@ enum SensorKeys {
         case .m5: return ["Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g"]
         }
     }
+    /// Manual and Curve can hold fans below what macOS would choose, so they need this chip's own sensor keys.
+    /// An unknown chip's readings may come from keys that mean something else on it; it gets Auto and Max only.
+    static func requireKnown(_ generation: Generation?) throws {
+        guard generation != nil else {
+            throw Failure("Baadgir doesn't know this chip's temperature sensors, so only Auto and Max are available")
+        }
+    }
     private static func unique(_ keys: [String]) -> [String] {
         var seen = Set<String>()
         return keys.filter { seen.insert($0).inserted }
@@ -328,10 +335,16 @@ struct CoolingPolicy {
     // Conservative software cutoffs, not manufacturer-certified limits.
     static let startLimit = 75.0
     static let stopLimit = 80.0
+    static let batteryLimit = 45.0
+    static let ssdLimit = 70.0
+    /// Battery and SSD are below their cutoffs, or have no sensor.
+    static func othersBelowLimits(_ temperatures: Temperatures) -> Bool {
+        (temperatures.battery.map { $0 < batteryLimit } ?? true) && (temperatures.ssd.map { $0 < ssdLimit } ?? true)
+    }
     /// Curve speed for the current readings; infinity (all fans at maximum) when it's hot.
     static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, thermal: ThermalLevel) -> Double {
         guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
-              temperatures.battery.map({ $0 < 45 }) ?? true else { return .infinity }
+              othersBelowLimits(temperatures) else { return .infinity }
         // Rounding must not leave the curve's range, which is within the fans' hardware range.
         let rounded = (curve.rpm(at: temperatures.highest) / 50).rounded() * 50
         return min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm)
@@ -357,10 +370,13 @@ struct CoolingPolicy {
                                    : "Thermal pressure is high; returning to automatic cooling")
         }
         let limit = starting ? startLimit : stopLimit
-        guard temperatures.highest < limit,
-              temperatures.battery.map({ $0 < 45 }) ?? true else {
+        guard temperatures.highest < limit else {
             throw Failure(starting ? "Manual speed starts below \(Int(startLimit))°C. Use Max to cool down first."
                                    : "Temperature is high; returning to automatic cooling")
+        }
+        guard othersBelowLimits(temperatures) else {
+            throw Failure(starting ? "Battery or SSD is too warm for manual speed. Use Max to cool down first."
+                                   : "Battery or SSD is hot; returning to automatic cooling")
         }
     }
 }

@@ -49,6 +49,11 @@ let hotGPU = try Temperatures(cpu: [50], gpu: [80])
 rejects("GPU temperature cutoff") { try CoolingPolicy.validateTemperature(hotGPU, thermal: .nominal, starting: false) }
 let hotBattery = try Temperatures(cpu: [50], gpu: [50], battery: [45])
 rejects("Battery temperature cutoff") { try CoolingPolicy.validateTemperature(hotBattery, thermal: .nominal, starting: false) }
+let hotSSD = try Temperatures(cpu: [50], gpu: [50], ssd: [CoolingPolicy.ssdLimit])
+rejects("SSD temperature cutoff") { try CoolingPolicy.validateTemperature(hotSSD, thermal: .nominal, starting: false) }
+rejects("Hot SSD at session start") { try CoolingPolicy.validateTemperature(hotSSD, thermal: .nominal, starting: true) }
+try CoolingPolicy.validateTemperature(try Temperatures(cpu: [50], gpu: [50], battery: [44], ssd: [69]), thermal: .nominal, starting: true)
+checks += 1
 for level in [ThermalLevel.serious, .critical, .unknown] {
     rejects("High or unknown thermal pressure") { try CoolingPolicy.validateTemperature(normal, thermal: level, starting: false) }
 }
@@ -147,6 +152,7 @@ check(CoolingPolicy.curveSpeed(curve, cool, thermal: .nominal) == 2500, "Curve f
 check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal) == .infinity, "Curve runs maximum at the stop limit")
 check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious) == .infinity, "Curve runs maximum under thermal pressure")
 check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal) == .infinity, "Curve runs maximum with a hot battery")
+check(CoolingPolicy.curveSpeed(curve, hotSSD, thermal: .nominal) == .infinity, "Curve runs maximum with a hot SSD")
 let oddHardware = try HardwareBounds(ranges: [(1217, 5779)])
 let oddCurve = FanCurve.standard(for: oddHardware)
 let oddSpeeds = [30.0, 55, 60, 79].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal) }
@@ -248,4 +254,7 @@ check(!TemperatureReading.available(fanless: true).contains(.fan) && Temperature
 check(TemperatureReading.shown([.cpu, .fan], fanless: true) == [.cpu] && TemperatureReading.shown([.fan], fanless: true) == [.hottest] &&
       TemperatureReading.shown([.cpu, .fan], fanless: false) == [.cpu, .fan],
       "A fanless Mac drops fan speed from the menu bar and never shows nothing")
+rejects("An unknown chip gets no Manual or Curve") { try SensorKeys.requireKnown(nil) }
+try SensorKeys.Generation.allCases.forEach { try SensorKeys.requireKnown($0) }
+checks += 1
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")

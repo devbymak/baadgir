@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import IOKit
 import Darwin
 import ServiceManagement
@@ -210,9 +211,17 @@ func openSessionDirectory(_ path: String, owner: uid_t) throws -> Int32 {
     }
     return folder
 }
+/// In a folder only root can write (unlike /var/run, which the daemon group can), so nothing else can hold the lock
+/// and keep the watchdog from restoring Auto.
+let lockPath = "/var/db/local.baadgir.lock"
 func acquireLock() throws -> Int32 {
-    let lock = open("/var/run/local.baadgir.lock", O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+    let lock = open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard lock >= 0 else { throw Failure("Cannot create cooling session lock") }
+    var info = stat()
+    guard fstat(lock, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0 else {
+        close(lock)
+        throw Failure("Cooling session lock is invalid")
+    }
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
         close(lock)
         throw Failure(lockBusy)
@@ -258,6 +267,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
         throw Failure("Another app already controls a fan. Return it to Auto first.")
     }
     let bounds = try HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
+    let generation = SensorKeys.generation(brand: chipName())
     var heartbeat = Heartbeat()
     func requestedTarget() throws -> CoolingTarget {
         let (target, modified) = try readControl(in: folder, owner: owner)
@@ -266,8 +276,11 @@ func coolingSession(parent: pid_t, directory: String) throws {
         }
         switch target {
         case .manual(let rpm):
+            try SensorKeys.requireKnown(generation)
             try CoolingPolicy.validateRange(rpm: rpm, minimum: bounds.minimum, maximum: bounds.maximum, hardware: bounds)
-        case .curve(let curve): try curve.validate(hardware: bounds)
+        case .curve(let curve):
+            try SensorKeys.requireKnown(generation)
+            try curve.validate(hardware: bounds)
         case .maximum: break
         }
         return target
@@ -424,11 +437,21 @@ func startWatchdog(executable: String) throws -> Int32 {
     guard result == 0 else { close(fds[1]); throw Failure("Cannot start the safety watchdog") }
     return fds[1]
 }
+/// The executable a process runs, as the kernel sees it.
+func executablePath(_ pid: pid_t) -> String? {
+    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+    return String(cString: buffer)
+}
 /// Waits for the helper to exit or stall, then makes sure no fan is left in manual mode.
 func watchdog() {
+    // Only as started by `startWatchdog`: run by hand, there is no pipe, and the parent is a shell rather than the helper.
+    var stdinInfo = stat()
+    guard fstat(STDIN_FILENO, &stdinInfo) == 0, stdinInfo.st_mode & S_IFMT == S_IFIFO else { return }
     signal(SIGHUP, SIG_IGN); signal(SIGINT, SIG_IGN)
     // The helper spawned this process; read now, before a helper exit hands it to launchd.
     let helper = getppid()
+    let parentIsHelper = helper > 1 && executablePath(helper) == helperPath
     var input = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
     var byte: UInt8 = 0
     var stalled = false
@@ -440,7 +463,7 @@ func watchdog() {
         if count == 0 || (count < 0 && errno != EINTR) { break }
     }
     // The pipe is still open, so the helper is alive but stuck, possibly holding fans at a stale speed.
-    if stalled, helper > 1 { kill(helper, SIGKILL) }
+    if stalled, parentIsHelper { kill(helper, SIGKILL) }
     // The helper's lock may close a moment after the pipe, and the SMC can fail briefly; keep trying for a few seconds.
     for _ in 0..<30 {
         do { try restoreAutomatic(); return } catch { usleep(100_000) }
@@ -542,8 +565,9 @@ final class CoolingModel: ObservableObject {
     @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
-    /// Asks in Baadgir before a request from outside starts cooling. Nil or false declines.
-    var confirmRemoteStart: ((FanMode) -> Bool)?
+    /// Asks in Baadgir before a request from outside starts cooling or picks a manual speed: the mode, the manual RPM,
+    /// and whether it starts a session. Nil or false declines.
+    var confirmRemote: ((FanMode, Double?, Bool) -> Bool)?
     /// Runs a request from a link, Shortcuts, or the command line, with the same checks as the popover.
     func perform(_ command: RemoteCommand) {
         guard allowsLinks else {
@@ -561,9 +585,12 @@ final class CoolingModel: ObservableObject {
             }
             wanted = .manual
         }
-        // Any web page can open a link. Starting cooling raises the administrator prompt, so it needs a click here first;
-        // switching modes inside a running session and returning to Auto don't.
-        if wanted != .auto, !sessionRunning, confirmRemoteStart?(wanted) != true { return }
+        // Any web page can open a link. Starting cooling raises the administrator prompt, and Manual can run the fans slower
+        // than macOS would, so both need a click here first; Max or Curve inside a running session and Auto don't.
+        var rpm: Double?
+        if case .manual(let requested) = command { rpm = requested ?? selectedRPM.rounded() }
+        if wanted == .manual || (wanted != .auto && !sessionRunning),
+           confirmRemote?(wanted, rpm, !sessionRunning) != true { return }
         if case .manual(let rpm?) = command { selectedRPM = rpm }
         select(wanted)
     }
@@ -813,7 +840,10 @@ final class CoolingModel: ObservableObject {
         }
         onUpdate?()
     }
+    /// Read once: the chip doesn't change while the app runs.
+    private let chipGeneration = SensorKeys.generation(brand: chipName())
     private func curveBlocker() -> String? {
+        do { try SensorKeys.requireKnown(chipGeneration) } catch { return String(describing: error) }
         guard curve != nil else { return curveError ?? "Set up a fan curve in Settings first." }
         guard temperatures != nil else { return "Temperature readings are unavailable; keeping automatic cooling" }
         return nil
@@ -821,6 +851,7 @@ final class CoolingModel: ObservableObject {
     private func manualBlocker() -> String? {
         guard let bounds, let minimum, let maximum else { return "Fan limits are unavailable." }
         do {
+            try SensorKeys.requireKnown(chipGeneration)
             try CoolingPolicy.validateRange(rpm: selectedRPM.rounded(), minimum: minimum,
                                             maximum: maximum, hardware: bounds)
             // Already in manual: the helper enforces the running cutoff.
@@ -849,6 +880,9 @@ final class CoolingModel: ObservableObject {
     private var sessionStarted = false
     /// Why the app itself ended the session, when the user didn't ask.
     private var forcedReason: String?
+    /// Keeps App Nap from delaying the heartbeat while a session runs; a late heartbeat ends the session.
+    /// System sleep stays allowed: it ends the session anyway.
+    private var activity: NSObjectProtocol?
     private func startSession(_ newMode: FanMode) {
         guard helper == nil else { return }
         if notifiesOnReturn { requestNotificationPermission() }
@@ -866,11 +900,15 @@ final class CoolingModel: ObservableObject {
             }
             self.directory = nil; self.sessionRunning = false; self.sessionStarted = false; self.forcedReason = nil
             self.mode = .auto; self.pending = nil; self.stopRequested = false
+            if let activity = self.activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
             try? FileManager.default.removeItem(at: directory)
             if success { self.message = nil }
         }
-        if started { pending = "Waiting for administrator authorization…" }
-        else {
+        if started {
+            pending = "Waiting for administrator authorization…"
+            activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                                                             reason: "Baadgir is controlling the fans")
+        } else {
             sessionRunning = false; mode = .auto; self.directory = nil
             try? FileManager.default.removeItem(at: directory)
         }
@@ -1049,9 +1087,9 @@ struct ControlsView: View {
         case .auto:
             return "macOS controls the fans. Curve, Manual and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
         case .curve:
-            return "Follows your curve from Settings when it asks for more than macOS, never less. Maximum at 80°C or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
+            return "Follows your curve from Settings when it asks for more than macOS, never less. Maximum at 80°C, a hot battery or SSD, or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
         case .manual:
-            return "Drag to change speed. Returns to Auto at 80°C, high thermal pressure, sleep, quit, or if monitoring fails."
+            return "Drag to change speed. Returns to Auto at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
         case .maximum:
             return "Fans run at full speed until you choose Auto, sleep, or quit."
         }
@@ -1077,103 +1115,151 @@ struct ControlsView: View {
     }
 }
 
+/// A page of the Settings window, shown as a toolbar tab.
+enum SettingsPage: String, CaseIterable {
+    case general, appearance, fans, automation
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .appearance: return "Appearance"
+        case .fans: return "Fans"
+        case .automation: return "Automation"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape"
+        case .appearance: return "menubar.rectangle"
+        case .fans: return "fan"
+        case .automation: return "bolt.badge.automatic"
+        }
+    }
+    /// A fanless Mac has nothing to control, so only General and Appearance.
+    static func available(fanless: Bool) -> [SettingsPage] { fanless ? [.general, .appearance] : allCases }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: CoolingModel
+    let page: SettingsPage
     var body: some View {
         Form {
-            Section {
-                Toggle("Launch at login", isOn: Binding(
-                    get: { [.enabled, .requiresApproval].contains(model.loginItemStatus) },
-                    set: { model.setLaunchAtLogin($0) }))
-                if model.loginItemStatus == .requiresApproval {
-                    HStack {
-                        Text("Allow Baadgir in Login Items to finish.").font(.caption).foregroundStyle(.orange)
-                        Spacer()
-                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
-                    }
-                }
-                if !model.fanless {
-                    Toggle("Notify when fans return to Auto on their own", isOn: $model.notifiesOnReturn)
-                    Toggle("⌃⌥M switches between Max and Auto", isOn: $model.usesMaxHotKey)
-                    Toggle("Allow Shortcuts, baadgir:// links and the command line to change fan mode", isOn: $model.allowsLinks)
-                }
-                if let error = model.hotKeyError {
-                    Text(error).font(.caption).foregroundStyle(.orange)
-                }
-                if let error = model.loginItemError {
-                    Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-                }
-            } header: {
-                Text("General")
+            switch page {
+            case .general: general
+            case .appearance: appearance
+            case .fans: fans
+            case .automation: automation
             }
-            Section {
-                Picker("Layout", selection: $model.stacksMenuBarReadings) {
-                    Text("Side by side").tag(false)
-                    Text("Stacked").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .disabled(model.shownMenuBarReadings.count < 2)  // One reading has nothing to stack.
-                Toggle(model.fanless ? "Show the thermometer icon" : "Show the fan icon", isOn: $model.showsMenuBarIcon)
-                ForEach(TemperatureReading.available(fanless: model.fanless), id: \.self) { reading in
-                    Toggle(reading.title, isOn: Binding(get: { model.shownMenuBarReadings.contains(reading) },
-                                                        set: { _ in model.toggleMenuBar(reading) }))
-                        .disabled(model.shownMenuBarReadings == [reading])  // At least one reading stays on.
-                }
-                Toggle("Color temperatures and fan speed by heat", isOn: $model.colorsTemperatures)
-                Toggle("Show the last 10 minutes in the popover", isOn: $model.showsHistory)
-            } header: {
-                Text("Menu Bar")
-            } footer: {
-                Text("Yellow and red start at 70°C and 85°C for CPU and GPU, 35°C and 40°C for battery, and 55°C and 70°C for SSD. High thermal pressure also turns readings yellow or red.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            if !model.fanless { fanSections }
         }
         .formStyle(.grouped)
-        // Fixed height so the window fits small screens; the form scrolls.
-        .frame(width: 440, height: model.fanless ? 420 : 680)
+        .frame(width: 460)
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear { model.refreshLoginItemStatus() }
     }
-    @ViewBuilder private var fanSections: some View {
+
+    @ViewBuilder private var general: some View {
         Section {
-            TextField("Minimum RPM", text: $model.minimumText)
-            TextField("Maximum RPM", text: $model.maximumText)
+            Toggle("Launch at login", isOn: Binding(
+                get: { [.enabled, .requiresApproval].contains(model.loginItemStatus) },
+                set: { model.setLaunchAtLogin($0) }))
+            if model.loginItemStatus == .requiresApproval {
+                HStack {
+                    Text("Allow Baadgir in Login Items to finish.").font(.caption).foregroundStyle(.orange)
+                    Spacer()
+                    Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                }
+            }
+            if let error = model.loginItemError { warning(error) }
+            if !model.fanless {
+                Toggle(isOn: $model.notifiesOnReturn) {
+                    Text("Notify when fans return to Auto")
+                    Text("When Baadgir hands the fans back to macOS on its own, such as after a safety cutoff.")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var appearance: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Readings")
+                let readings = TemperatureReading.available(fanless: model.fanless)
+                Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
+                    ForEach(Array(stride(from: 0, to: readings.count, by: 3)), id: \.self) { start in
+                        GridRow {
+                            ForEach(readings[start..<min(start + 3, readings.count)], id: \.self) { reading in
+                                Toggle(reading.title, isOn: Binding(get: { model.shownMenuBarReadings.contains(reading) },
+                                                                    set: { _ in model.toggleMenuBar(reading) }))
+                                    .toggleStyle(.checkbox)
+                                    .disabled(model.shownMenuBarReadings == [reading])  // At least one reading stays on.
+                            }
+                        }
+                    }
+                }
+            }
+            Picker("Layout", selection: $model.stacksMenuBarReadings) {
+                Text("Side by side").tag(false)
+                Text("Stacked").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .disabled(model.shownMenuBarReadings.count < 2)  // One reading has nothing to stack.
+            Toggle(model.fanless ? "Thermometer icon" : "Fan icon", isOn: $model.showsMenuBarIcon)
+            Toggle(isOn: $model.colorsTemperatures) {
+                Text("Color by heat")
+                Text("Yellow and red start at 70°C and 85°C for CPU and GPU, 35°C and 40°C for battery, and 55°C and 70°C for SSD. High thermal pressure also turns readings yellow or red.")
+            }
+        } header: {
+            Text("Menu Bar")
+        }
+        Section {
+            Toggle(isOn: $model.showsHistory) {
+                Text("History graphs")
+                Text("Show the last 10 minutes of temperatures and fan speed.")
+            }
+        } header: {
+            Text("Popover")
+        }
+    }
+
+    @ViewBuilder private var fans: some View {
+        Section {
+            rpmField("Minimum", text: $model.minimumText)
+            rpmField("Maximum", text: $model.maximumText)
             if model.bounds != nil && !model.rangeIsValid {
-                Text("Enter a minimum below the maximum, within the hardware range.")
-                    .font(.caption).foregroundStyle(.orange)
+                warning("Enter a minimum below the maximum, within the hardware range.")
             }
         } header: {
             Text("Manual Speed Limits")
         } footer: {
-            Text(model.bounds.map { "Sets the Manual slider's range. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
-                 ?? "Reading fan limits…")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            footer(model.bounds.map { "Sets the Manual slider's range. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
+                   ?? "Reading fan limits…")
         }
         .disabled(model.bounds == nil)
         Section {
+            if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
+            HStack {
+                Text("Point").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Temperature").frame(width: 92, alignment: .trailing)
+                Text("Speed").frame(width: 110, alignment: .trailing)
+            }
+            .font(.caption).foregroundStyle(.secondary)
             ForEach(0..<FanCurve.pointCount, id: \.self) { index in
                 HStack {
-                    Text("Point \(index + 1)")
-                    Spacer()
-                    TextField("°C", text: $model.curveTemperatureTexts[index]).frame(width: 50)
-                    Text("°C").foregroundStyle(.secondary)
-                    TextField("RPM", text: $model.curveRPMTexts[index]).frame(width: 64)
-                    Text("RPM").foregroundStyle(.secondary)
+                    Text("\(index + 1)").monospacedDigit().frame(maxWidth: .infinity, alignment: .leading)
+                    unitField($model.curveTemperatureTexts[index], unit: "°C", width: 50).frame(width: 92, alignment: .trailing)
+                    unitField($model.curveRPMTexts[index], unit: "RPM", width: 64).frame(width: 110, alignment: .trailing)
                 }
-                .labelsHidden().multilineTextAlignment(.trailing)
             }
-            if let error = model.curveError {
-                Text(error).font(.caption).foregroundStyle(.orange)
-            }
-            if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
+            if let error = model.curveError { warning(error) }
             HStack { Spacer(); Button("Reset to Default") { model.resetCurve() } }
         } header: {
             Text("Fan Curve")
         } footer: {
-            Text("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery or high thermal pressure, fans run at maximum.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery or high thermal pressure, fans run at maximum.")
         }
         .disabled(model.bounds == nil)
+    }
+
+    @ViewBuilder private var automation: some View {
         Section {
             Toggle("On battery, return to Auto and stay there", isOn: $model.rules.autoOnBattery)
             Picker("When plugged in", selection: $model.rules.onAdapter) {
@@ -1182,12 +1268,90 @@ struct SettingsView: View {
                 Text("Switch to Max").tag(FanMode?.some(.maximum))
             }
         } header: {
-            Text("Rules")
+            Text("Power")
         } footer: {
-            Text("The plugged-in rule runs when you connect power and when Baadgir starts while plugged in, only if fans are on Auto. Starting a mode may ask for your administrator password.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            footer("The plugged-in rule runs when you connect power and when Baadgir starts while plugged in, only if fans are on Auto. Starting a mode may ask for your administrator password.")
         }
         .disabled(model.bounds == nil)
+        Section {
+            Toggle(isOn: $model.usesMaxHotKey) {
+                Text("Keyboard shortcut")
+                Text("⌃⌥M switches between Max and Auto from any app.")
+            }
+            if let error = model.hotKeyError { warning(error) }
+            Toggle(isOn: $model.allowsLinks) {
+                Text("Shortcuts, links and command line")
+                Text("Let Shortcuts, baadgir:// links and the command line change the fan mode. Baadgir still asks before starting cooling or setting a manual speed.")
+            }
+        } header: {
+            Text("Control")
+        }
+    }
+
+    private func rpmField(_ title: String, text: Binding<String>) -> some View {
+        LabeledContent(title) { unitField(text, unit: "RPM", width: 64) }
+    }
+    private func unitField(_ text: Binding<String>, unit: String, width: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            TextField(unit, text: text).labelsHidden().textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing).monospacedDigit().frame(width: width)
+            Text(unit).foregroundStyle(.secondary)
+        }
+    }
+    private func warning(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+    }
+    private func footer(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Settings as toolbar tabs, like the system's own settings windows. The window fits each page as it is selected.
+final class SettingsTabs: NSTabViewController {
+    private let model: CoolingModel
+    private var fanlessWatch: AnyCancellable?
+    private var sizeWatch: NSKeyValueObservation?
+    init(model: CoolingModel) {
+        self.model = model
+        super.init(nibName: nil, bundle: nil)
+        tabStyle = .toolbar
+        transitionOptions = []
+        fanlessWatch = model.$fanless.removeDuplicates().sink { [weak self] in self?.showPages(fanless: $0) }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+    private func showPages(fanless: Bool) {
+        let pages = SettingsPage.available(fanless: fanless)
+        guard tabViewItems.map({ $0.identifier as? String }) != pages.map(\.rawValue) else { return }
+        let selected = tabViewItems.indices.contains(selectedTabViewItemIndex)
+            ? tabViewItems[selectedTabViewItemIndex].identifier as? String : nil
+        for item in tabViewItems { removeTabViewItem(item) }
+        for page in pages {
+            let host = NSHostingController(rootView: SettingsView(model: model, page: page))
+            host.sizingOptions = .preferredContentSize
+            host.title = page.title  // The window takes the selected page's title.
+            let item = NSTabViewItem(viewController: host)
+            item.identifier = page.rawValue
+            item.label = page.title
+            item.image = NSImage(systemSymbolName: page.symbol, accessibilityDescription: page.title)
+            addTabViewItem(item)
+        }
+        selectedTabViewItemIndex = pages.firstIndex { $0.rawValue == selected } ?? 0
+    }
+    override func tabView(_ tabView: NSTabView, didSelect item: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: item)
+        guard let page = item?.viewController else { return }
+        // Follow the page as it grows or shrinks, such as when a warning appears.
+        sizeWatch = page.observe(\.preferredContentSize, options: [.initial, .new]) { [weak self] page, _ in
+            DispatchQueue.main.async { self?.fit(page.preferredContentSize) }
+        }
+    }
+    /// Keeps the title bar in place, the way system settings windows resize.
+    private func fit(_ size: NSSize) {
+        guard let window = view.window, size.width > 0, size.height > 0 else { return }
+        let frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        guard frame.size != window.frame.size else { return }
+        window.setFrame(NSRect(x: window.frame.minX, y: window.frame.maxY - frame.height, width: frame.width, height: frame.height),
+                        display: true, animate: window.isVisible)
     }
 }
 
@@ -1382,6 +1546,20 @@ struct CurvePreview: View {
                 y: (1 - (rpm - bounds.minimum) / (bounds.maximum - bounds.minimum)) * size.height)
     }
     var body: some View {
+        VStack(spacing: 2) {
+            graph
+            HStack {
+                Text("\(Int(low))°C")
+                Spacer()
+                Text("\(Int(high))°C · max")
+            }
+            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Fan curve preview")
+    }
+    private var graph: some View {
         GeometryReader { geometry in
             Path { path in
                 path.move(to: point(low, curve.rpm(at: low), in: geometry.size))
@@ -1395,9 +1573,8 @@ struct CurvePreview: View {
                     .position(point(item.temperature, item.rpm, in: geometry.size))
             }
         }
-        .frame(height: 70)
-        .padding(.vertical, 4)
-        .accessibilityLabel("Fan curve preview")
+        .frame(height: 80)
+        .background(alignment: .bottom) { Divider() }
     }
 }
 
@@ -1442,7 +1619,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         popover.contentViewController = host
         model.onMenuBarLayoutChange = { [weak self] in self?.layoutPending = true; self?.refreshStatusItem() }
         model.onUpdate = { [weak self] in self?.refreshStatusItem(); self?.runQueuedCommands() }
-        model.confirmRemoteStart = { [weak self] mode in self?.confirmStart(mode) ?? false }
+        model.confirmRemote = { [weak self] mode, rpm, starts in self?.confirmRemote(mode, rpm: rpm, startsSession: starts) ?? false }
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.model.refresh() }
         RunLoop.main.add(timer!, forMode: .common)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
@@ -1482,23 +1659,30 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         runQueuedCommands()
     }
     private var confirming = false
-    /// Asks before a link, Shortcut or command starts cooling, so a web page can't raise the password prompt on its own.
-    private func confirmStart(_ mode: FanMode) -> Bool {
+    /// Asks before a link, Shortcut or command starts cooling, so a web page can't raise the password prompt on its own,
+    /// or picks a manual speed, so it can't slow the fans on its own.
+    private func confirmRemote(_ mode: FanMode, rpm: Double?, startsSession: Bool) -> Bool {
         // One question at a time; requests that arrive meanwhile are declined.
         guard !confirming else { return false }
         let name: String
         switch mode {
         case .curve: name = "Curve"
-        case .manual: name = "Manual"
+        case .manual: name = "Manual" + (rpm.map { " at \(Int($0.rounded()).formatted()) RPM" } ?? "")
         case .maximum: name = "Max"
         case .auto: return true
         }
         confirming = true
         defer { confirming = false }
         let alert = NSAlert()
-        alert.messageText = "Start \(name) cooling?"
-        alert.informativeText = "A link, Shortcut or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
-        alert.addButton(withTitle: "Start \(name)")
+        if startsSession {
+            alert.messageText = "Start \(name) cooling?"
+            alert.informativeText = "A link, Shortcut or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
+            alert.addButton(withTitle: "Start")
+        } else {
+            alert.messageText = "Switch to \(name)?"
+            alert.informativeText = "A link, Shortcut or command asked Baadgir to change the fan speed. Manual can run the fans slower than macOS would."
+            alert.addButton(withTitle: "Switch")
+        }
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
@@ -1728,14 +1912,13 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         popover.performClose(nil)
         model.refreshLoginItemStatus()
         if settingsWindow == nil {
-            let host = NSHostingController(rootView: SettingsView(model: model))
-            host.sizingOptions = .preferredContentSize
-            let window = NSWindow(contentViewController: host)
-            window.title = "Baadgir Settings"
+            let tabs = SettingsTabs(model: model)
+            let window = NSWindow(contentViewController: tabs)
             window.styleMask = [.titled, .closable]
+            window.toolbarStyle = .preference
             window.isReleasedWhenClosed = false
-            // Size to the SwiftUI content first; centering the default-sized window leaves it off-center once it grows.
-            window.setContentSize(host.view.fittingSize)
+            // Size to the first page before centering; centering the default-sized window leaves it off-center once it grows.
+            if let page = tabs.tabViewItems.first?.viewController { window.setContentSize(page.view.fittingSize) }
             window.center()
             settingsWindow = window
         }
