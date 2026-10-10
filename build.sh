@@ -35,13 +35,20 @@ PLIST
 codesign --force --sign - --options runtime 'Baadgir.app'
 echo 'Built Baadgir.app'
 if [[ "${1:-}" == "--install" ]]; then
+  # Replace only an earlier Baadgir, never another app with the same name. Checked before anything is installed.
+  if [[ -e '/Applications/Baadgir.app' && "$(plutil -extract CFBundleIdentifier raw -o - '/Applications/Baadgir.app/Contents/Info.plist' 2>/dev/null || true)" != local.baadgir ]]; then
+    echo '/Applications/Baadgir.app is not Baadgir; leaving it in place.' >&2; exit 1
+  fi
   # Fan control runs as root only from this root-owned copy, which apps running as you cannot replace.
   # Installed first, so a cancelled password prompt leaves the running app untouched.
   sudo mkdir -p /Library/PrivilegedHelperTools
   sudo install -o root -g wheel -m 755 'Baadgir.app/Contents/MacOS/baadgir' /Library/PrivilegedHelperTools/local.baadgir.helper
-  # Quit the running copy first; it restores automatic cooling before exiting.
-  osascript -e 'if application id "local.baadgir" is running then tell application id "local.baadgir" to quit' >/dev/null
-  for _ in {1..50}; do pgrep -qf '/Applications/Baadgir.app/Contents/MacOS/baadgir$' || break; sleep 0.2; done
+  # Quit every running copy first, wherever it was started; it restores automatic cooling before exiting. Matched by
+  # bundle ID, like the app's own one-copy check, so a copy still running would also make the new one quit at launch.
+  running() { [[ -n "$(lsappinfo find bundleid=local.baadgir)" ]] }
+  if running; then osascript -e 'tell application id "local.baadgir" to quit' >/dev/null; fi
+  for _ in {1..50}; do running || break; sleep 0.2; done
+  if running; then echo 'Baadgir is still running; quit it, then run ./build.sh --install again.' >&2; exit 1; fi
   rm -rf '/Applications/Baadgir.app'
   ditto 'Baadgir.app' '/Applications/Baadgir.app'
   # Only the installed copy should handle baadgir:// links and Launch at Login.
