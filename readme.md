@@ -8,19 +8,19 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 
 ## Features
 
-- CPU/GPU/battery/SSD temperatures, fan RPM, and macOS thermal pressure, coloured green/yellow/red.
-- Menu bar shows any mix of hottest, CPU, GPU, battery and SSD temperature and average fan speed (Settings → Appearance).
+- CPU/GPU/battery/SSD temperatures, fan RPM, and macOS thermal pressure, colored green/yellow/red.
+- Menu bar shows any mix of hottest, CPU, GPU, battery, and SSD temperature and average fan speed (Settings → Appearance).
 - System power draw and adapter input in watts (display only).
 - Menu bar readings in one row, or stacked two to a column in a smaller font (Settings → Appearance → Layout). The fan icon can be hidden to save space.
-- Settings window (popover → Settings…, or right-click → Settings…) with General, Appearance (menu bar readings, layout, colours, history graphs), Fans (manual speed limits, the fan curve) and Automation (power rules, the hotkey, Shortcuts and links) tabs.
-- Last 10 minutes of CPU/GPU temperature and fan speed as small graphs in the popover, kept in memory only.
+- Settings window (popover → Settings…, or right-click → Settings…) with General, Appearance (menu bar readings, layout, colors, history graphs), Fans (manual speed limits, the fan curve), and Automation (power rules, the hotkey, Shortcuts and links) tabs.
+- Popover graphs of the last 10 minutes of CPU/GPU temperature and fan speed, with value and time axes (hover for exact values), kept in memory only.
 - No logs: readings and errors are never written to disk. Only preferences (limits, speed, menu bar choices) are saved.
-- Auto / Curve / Manual / Max fan modes, from the popover or the menu bar icon's right-click menu. Curve, Manual and Max stay on until you choose Auto.
+- Auto / Curve / Manual / Max fan modes, from the popover or the menu bar icon's right-click menu. Curve, Manual, and Max stay on until you choose Auto.
 - Fan curve: four editable temperature → RPM points with a live preview. Curve mode only takes over when the curve asks for more than macOS is running, and never runs a fan below the speed macOS had chosen.
 - Rules: return to Auto (and stay there) on battery; switch to Curve or Max when plugged in, including at launch.
 - Optional notification when fans return to Auto on their own (safety cutoff, sensor failure, helper exit), with the reason.
 - ⌃⌥M switches between Max and Auto from any app (can be turned off in Settings → Automation).
-- Shortcuts, links and command line: `baadgir://auto`, `baadgir://curve`, `baadgir://max`, `baadgir://manual?rpm=3000`, or `baadgir status | auto | curve | max | manual [RPM]`. Requests get the same safety checks as the app, and one that would start cooling or pick a manual speed asks for confirmation in Baadgir first. Off by default; turn them on in Settings.
+- Shortcuts, links, and command line: `baadgir://auto`, `baadgir://curve`, `baadgir://max`, `baadgir://manual?rpm=3000`, or `baadgir status | auto | curve | max | manual [RPM]`. Requests get the same safety checks as the app, and one that would start cooling or pick a manual speed asks for confirmation in Baadgir first. Off by default; turn them on in Settings.
 - Live manual-speed slider with editable, remembered minimum and maximum RPM limits.
 - One administrator prompt per session; speed and mode changes inside a session need no new prompt.
 - Automatic-control restoration attempted on Auto, quit, sleep, app crash or freeze, and monitoring failure.
@@ -30,7 +30,7 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 
 Requires an Apple silicon Mac, macOS 13+, and Xcode Command Line Tools.
 
-Works on M1 through M5 chips, using each generation's own sensor keys; a newer chip probes every known key to show temperatures, but offers only Auto and Max until its sensor keys are added, since Manual and Curve rely on them. Macs with two fans (14" and 16" MacBook Pro) are controlled together within the speed range both fans support. Fanless Macs, such as the MacBook Air, show temperatures only. `baadgir status` prints the chip, fans and sensor keys it found.
+Works on M1 through M5 chips, using each generation's own sensor keys; a newer chip probes every known key to show temperatures, but offers only Auto and Max until its sensor keys are added, since Manual and Curve rely on them. Macs with two fans (14" and 16" MacBook Pro) are controlled together within the speed range both fans support. Fanless Macs, such as the MacBook Air, show temperatures only. `baadgir status` prints the chip, fans, and sensor keys it found.
 
 ```sh
 ./test.sh
@@ -43,7 +43,7 @@ Fan control requires macOS administrator authorization and the helper that `--in
 
 ### Shortcuts and the command line
 
-First turn on Settings → Automation → Shortcuts, links and command line. Any web page or app can open a link, so leave it off if you don't use it. A request that would start Curve, Manual or Max shows a Baadgir confirmation before macOS asks for your password. A request for Manual is always confirmed, even during a running session, since it can run the fans slower than macOS would; switching to Max or Curve during a running session, or returning to Auto, is not. In Shortcuts, add an **Open URLs** action with a link such as `baadgir://max`. For the terminal, link the executable onto your `PATH`:
+First turn on Settings → Automation → Shortcuts, links, and command line. Any web page or app can open a link, so leave it off if you don't use it. A request that would start Curve, Manual, or Max shows a Baadgir confirmation before macOS asks for your password. A request for Manual is always confirmed, even during a running session, since it can run the fans slower than macOS would; switching to Max or Curve during a running session, or returning to Auto, is not. In Shortcuts, add an **Open URLs** action with a link such as `baadgir://max`. For the terminal, link the executable onto your `PATH`:
 
 ```sh
 ln -s /Applications/Baadgir.app/Contents/MacOS/baadgir /usr/local/bin/baadgir

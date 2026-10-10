@@ -491,7 +491,7 @@ final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
     /// No fans at all, such as a MacBook Air: Baadgir only shows temperatures. False until the first fan read.
     @Published private(set) var fanless = false {
-        didSet { if fanless != oldValue { onMenuBarLayoutChange?(); onHotKeyChange?() } }
+        didSet { if fanless != oldValue { onLayoutChange?(); onHotKeyChange?() } }
     }
     @Published var temperatures: Temperatures?
     @Published var power: PowerReadings?
@@ -511,19 +511,19 @@ final class CoolingModel: ObservableObject {
             .compactMap(TemperatureReading.init(rawValue:))
         return saved.isEmpty ? [.hottest] : saved
     }() {
-        didSet { defaults.set(menuBarReadings.map(\.rawValue), forKey: "menuBarReadings"); onMenuBarLayoutChange?() }
+        didSet { defaults.set(menuBarReadings.map(\.rawValue), forKey: "menuBarReadings"); onLayoutChange?() }
     }
     /// Readings two to a column in a smaller font, instead of one row.
     @Published var stacksMenuBarReadings = UserDefaults.standard.bool(forKey: "stacksMenuBarReadings") {
-        didSet { defaults.set(stacksMenuBarReadings, forKey: "stacksMenuBarReadings"); onMenuBarLayoutChange?() }
+        didSet { defaults.set(stacksMenuBarReadings, forKey: "stacksMenuBarReadings"); onLayoutChange?() }
     }
     /// The fan symbol before the readings; filled while Baadgir controls the fans.
     @Published var showsMenuBarIcon = UserDefaults.standard.object(forKey: "showsMenuBarIcon") as? Bool ?? true {
-        didSet { defaults.set(showsMenuBarIcon, forKey: "showsMenuBarIcon"); onMenuBarLayoutChange?() }
+        didSet { defaults.set(showsMenuBarIcon, forKey: "showsMenuBarIcon"); onLayoutChange?() }
     }
     /// The chosen readings this Mac can show.
     var shownMenuBarReadings: [TemperatureReading] { TemperatureReading.shown(menuBarReadings, fanless: fanless) }
-    var onMenuBarLayoutChange: (() -> Void)?
+    var onLayoutChange: (() -> Void)?
     func toggleMenuBar(_ reading: TemperatureReading) {
         if menuBarReadings.contains(reading) {
             guard shownMenuBarReadings.contains(where: { $0 != reading }) else { return }
@@ -571,7 +571,7 @@ final class CoolingModel: ObservableObject {
     /// Runs a request from a link, Shortcuts, or the command line, with the same checks as the popover.
     func perform(_ command: RemoteCommand) {
         guard allowsLinks else {
-            message = "Links, Shortcuts and the command line are turned off in Settings."; onUpdate?(); return
+            message = "Links, Shortcuts, and the command line are turned off in Settings."; onUpdate?(); return
         }
         let wanted: FanMode
         switch command {
@@ -620,7 +620,7 @@ final class CoolingModel: ObservableObject {
     @Published var colorsTemperatures = UserDefaults.standard.object(forKey: "colorsTemperatures") as? Bool ?? true {
         didSet { defaults.set(colorsTemperatures, forKey: "colorsTemperatures"); onUpdate?() }
     }
-    /// Colour band for a reading, or nil when colours are off or the value is missing.
+    /// Color band for a reading, or nil when colors are off or the value is missing.
     func heatLevel(_ reading: TemperatureReading, _ value: Double?) -> HeatLevel? {
         guard colorsTemperatures, let value else { return nil }
         if reading == .fan {
@@ -978,7 +978,7 @@ final class CoolingModel: ObservableObject {
     }
 }
 
-struct ControlsView: View {
+struct PopoverView: View {
     @ObservedObject var model: CoolingModel
     let quit: () -> Void
     var openSettings: () -> Void = {}
@@ -995,8 +995,8 @@ struct ControlsView: View {
                 Spacer()
             }
             HStack(alignment: .top, spacing: 12) {
-                temperature(.cpu, value: model.temperatures?.cpu)
-                temperature(.gpu, value: model.temperatures?.gpu)
+                temperature(.cpu, value: model.temperatures?.cpu, swatch: model.showsHistory ? HistoryView.cpuColor : nil)
+                temperature(.gpu, value: model.temperatures?.gpu, swatch: model.showsHistory ? HistoryView.gpuColor : nil)
                 if let battery = model.temperatures?.battery { temperature(.battery, value: battery) }
                 if let ssd = model.temperatures?.ssd { temperature(.ssd, value: ssd) }
             }
@@ -1014,7 +1014,8 @@ struct ControlsView: View {
                 HistoryView(samples: model.history.elements, fanMaximum: model.bounds?.maximum, showsFan: !model.fanless)
             }
             ForEach(model.fans, id: \.index) { fan in
-                HStack {
+                HStack(spacing: 5) {
+                    if model.showsHistory { GraphSwatch(color: HistoryView.fanColor) }
                     Text("Fan \(fan.index + 1)")
                     Spacer()
                     Text("\(Int(fan.rpm)) RPM").monospacedDigit()
@@ -1085,7 +1086,7 @@ struct ControlsView: View {
         case .auto where model.externallyControlled:
             return "Choose Auto to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. Curve, Manual and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
+            return "macOS controls the fans. Curve, Manual, and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
         case .curve:
             return "Follows your curve from Settings when it asks for more than macOS, never less. Maximum at 80°C, a hot battery or SSD, or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
         case .manual:
@@ -1102,9 +1103,12 @@ struct ControlsView: View {
         case .hot: return .red
         }
     }
-    private func temperature(_ reading: TemperatureReading, value: Double?) -> some View {
+    private func temperature(_ reading: TemperatureReading, value: Double?, swatch: Color? = nil) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(reading == .battery ? "Battery" : reading.title).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 5) {
+                if let swatch { GraphSwatch(color: swatch) }
+                Text(reading == .battery ? "Battery" : reading.title).font(.caption).foregroundStyle(.secondary)
+            }
             Text(value.map { String(format: "%.0f°C", $0) } ?? "—°C")
                 .font(.system(size: 26, weight: .medium, design: .rounded)).monospacedDigit()
                 .lineLimit(1).minimumScaleFactor(0.7)
@@ -1254,7 +1258,7 @@ struct SettingsView: View {
         } header: {
             Text("Fan Curve")
         } footer: {
-            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery or high thermal pressure, fans run at maximum.")
+            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running, and never goes below macOS's speed. At 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, fans run at maximum.")
         }
         .disabled(model.bounds == nil)
     }
@@ -1280,8 +1284,8 @@ struct SettingsView: View {
             }
             if let error = model.hotKeyError { warning(error) }
             Toggle(isOn: $model.allowsLinks) {
-                Text("Shortcuts, links and command line")
-                Text("Let Shortcuts, baadgir:// links and the command line change the fan mode. Baadgir still asks before starting cooling or setting a manual speed.")
+                Text("Shortcuts, links, and command line")
+                Text("Let Shortcuts, baadgir:// links, and the command line change the fan mode. Baadgir still asks before starting cooling or setting a manual speed.")
             }
         } header: {
             Text("Control")
@@ -1355,184 +1359,75 @@ final class SettingsTabs: NSTabViewController {
     }
 }
 
-/// Line through the values scaled to `range`; nil values leave gaps.
-struct Sparkline: Shape {
-    let values: [Double?]
-    let range: ClosedRange<Double>
-    let capacity: Int
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        var drawing = false
-        for (index, value) in values.enumerated() {
-            guard let value else { drawing = false; continue }
-            let point = Self.point(index, of: values.count, value: value, range: range, capacity: capacity, in: rect)
-            if drawing { path.addLine(to: point) } else { path.move(to: point); drawing = true }
-        }
-        return path
-    }
-    /// Newest sample at the right edge, so a fresh history grows in from the right.
-    static func x(_ index: Int, of count: Int, capacity: Int, in rect: CGRect) -> CGFloat {
-        rect.minX + rect.width * CGFloat(index + capacity - count) / CGFloat(max(capacity - 1, 1))
-    }
-    static func y(_ value: Double, range: ClosedRange<Double>, in rect: CGRect) -> CGFloat {
-        let clamped = min(max(value, range.lowerBound), range.upperBound)
-        return rect.maxY - rect.height * CGFloat((clamped - range.lowerBound) / max(range.upperBound - range.lowerBound, 1))
-    }
-    static func point(_ index: Int, of count: Int, value: Double, range: ClosedRange<Double>, capacity: Int, in rect: CGRect) -> CGPoint {
-        CGPoint(x: x(index, of: count, capacity: capacity, in: rect), y: y(value, range: range, in: rect))
-    }
-}
-
-/// One line per series over the last 10 minutes, with gridlines, value labels on the right and a crosshair on hover.
-struct HistoryChart: View {
-    struct Series { let values: [Double?]; let color: Color }
-    let series: [Series]
-    let scale: (range: ClosedRange<Double>, ticks: [Double])
-    let label: (Double) -> String
-    let capacity: Int
-    let height: CGFloat
-    /// Sample under the pointer, shared by the charts so they move together.
-    @Binding var hovered: Int?
-    static let axisWidth: CGFloat = 30
-    private let inset: CGFloat = 6  // Room for the top and bottom labels.
-    var body: some View {
-        GeometryReader { geometry in
-            let plot = CGRect(x: 0, y: inset, width: geometry.size.width - Self.axisWidth, height: geometry.size.height - 2 * inset)
-            let count = series.first?.values.count ?? 0
-            ZStack(alignment: .topLeading) {
-                Path { path in
-                    for tick in scale.ticks {
-                        let y = Sparkline.y(tick, range: scale.range, in: plot)
-                        path.move(to: CGPoint(x: plot.minX, y: y)); path.addLine(to: CGPoint(x: plot.maxX, y: y))
-                    }
-                    // Five minutes ago.
-                    path.move(to: CGPoint(x: plot.midX, y: plot.minY)); path.addLine(to: CGPoint(x: plot.midX, y: plot.maxY))
-                }
-                .stroke(.quaternary, lineWidth: 1)
-                ForEach(series.indices, id: \.self) { index in
-                    Sparkline(values: series[index].values, range: scale.range, capacity: capacity)
-                        .stroke(series[index].color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-                        .frame(width: plot.width, height: plot.height).offset(y: plot.minY)
-                }
-                if let hovered, hovered < count {
-                    let x = Sparkline.x(hovered, of: count, capacity: capacity, in: plot)
-                    Path { path in path.move(to: CGPoint(x: x, y: plot.minY)); path.addLine(to: CGPoint(x: x, y: plot.maxY)) }
-                        .stroke(.secondary, lineWidth: 1)
-                    ForEach(series.indices, id: \.self) { index in
-                        if let value = series[index].values[hovered] {
-                            Circle().fill(series[index].color).frame(width: 7, height: 7)
-                                .background(Circle().fill(Color(nsColor: .windowBackgroundColor)).padding(-1.5))
-                                .position(x: x, y: Sparkline.y(value, range: scale.range, in: plot))
-                        }
-                    }
-                }
-                ForEach(scale.ticks, id: \.self) { tick in
-                    Text(label(tick)).font(.system(size: 9)).monospacedDigit().foregroundStyle(.secondary)
-                        .frame(width: Self.axisWidth - 6, alignment: .leading)
-                        .position(x: plot.maxX + Self.axisWidth / 2 + 3, y: Sparkline.y(tick, range: scale.range, in: plot))
-                }
-            }
-            .contentShape(Rectangle())
-            .onContinuousHover { phase in
-                guard case .active(let location) = phase, count > 0, location.x <= plot.maxX else { hovered = nil; return }
-                let position = Int((location.x / plot.width * CGFloat(capacity - 1)).rounded()) - (capacity - count)
-                hovered = min(max(position, 0), count - 1)
-            }
-        }
-        .frame(height: height)
-    }
-}
-
-/// Ten-minute CPU/GPU temperature and fan speed charts.
+/// The last 10 minutes of CPU and GPU temperature and average fan speed, one sample a second. Memory only.
 struct HistoryView: View {
+    static let capacity = 600
+    /// Room for the value labels, shared by both graphs so their plot areas line up.
+    static let gutter: CGFloat = 34
+    static let cpuColor = Color.orange, gpuColor = Color.purple, fanColor = Color.teal
     let samples: [HistorySample]
     let fanMaximum: Double?
     var showsFan = true
-    private let capacity = 600
+    private let interval: TimeInterval = 1
     @StateObject private var pointer = Pointer()
-    /// Sample under the pointer. An object rather than `@State`, whose macro plugin plain swiftc builds cannot load.
+    /// Sample under the pointer, shared by both graphs. An object rather than `@State`, whose macro plugin plain swiftc
+    /// builds cannot load.
     final class Pointer: ObservableObject { @Published var hovered: Int? }
     var body: some View {
-        let hovered = pointer.hovered
         let temperatures = samples.flatMap { [$0.cpu, $0.gpu] }.compactMap { $0 }
         let fanPeak = samples.compactMap(\.fan).max()
-        // Values under the pointer, or the newest ones.
-        let shown = hovered.flatMap { samples.indices.contains($0) ? samples[$0] : nil } ?? samples.last
+        let span = Double(Self.capacity) * interval
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Last 10 minutes").font(.caption.weight(.medium))
-                Spacer()
-                if let hovered, hovered < samples.count {
-                    Text(Self.ago(seconds: samples.count - 1 - hovered)).monospacedDigit().foregroundStyle(.secondary)
-                }
+            // A little room around the readings, so a steady temperature doesn't run along an edge.
+            GraphFrame(scale: GraphScale(low: (temperatures.min() ?? 40) - 2, high: (temperatures.max() ?? 60) + 2, span: 20, intervals: 4),
+                       span: span, gutter: Self.gutter, timeAxis: !showsFan, label: Self.degrees) { layout in
+                graph(layout, [(samples.map(\.cpu), Self.cpuColor), (samples.map(\.gpu), Self.gpuColor)])
             }
-            .font(.caption)
-            HStack(spacing: 10) {
-                legend("CPU", .orange, shown?.cpu.map(Self.degrees))
-                legend("GPU", .purple, shown?.gpu.map(Self.degrees))
-                Spacer()
-                if let peak = temperatures.max() { Text("peak \(Self.degrees(peak))").foregroundStyle(.secondary) }
-            }
-            .font(.caption)
-            HistoryChart(series: [.init(values: samples.map(\.cpu), color: .orange), .init(values: samples.map(\.gpu), color: .purple)],
-                         scale: Self.temperatureScale(temperatures), label: Self.degrees, capacity: capacity, height: 88, hovered: $pointer.hovered)
+            .frame(height: showsFan ? 92 : 114)
             if showsFan {
-                HStack(spacing: 10) {
-                    legend("Fan", .teal, shown?.fan.map { "\(Int($0.rounded()).formatted()) RPM" })
-                    Spacer()
-                    if let fanPeak { Text("peak \(Int(fanPeak.rounded()).formatted()) RPM").foregroundStyle(.secondary) }
+                GraphFrame(scale: GraphScale(peak: fanMaximum ?? fanPeak ?? 0, minimum: 1000), span: span, gutter: Self.gutter,
+                           label: Self.rpm) { layout in
+                    graph(layout, [(samples.map(\.fan), Self.fanColor)])
                 }
-                .font(.caption)
-                .padding(.top, 4)
-                HistoryChart(series: [.init(values: samples.map(\.fan), color: .teal)],
-                             scale: Self.fanScale(maximum: fanMaximum ?? max(fanPeak ?? 1, 1)), label: Self.rpm,
-                             capacity: capacity, height: 56, hovered: $pointer.hovered)
+                .frame(height: 80)
             }
-            ZStack {
-                Text("10 min ago").frame(maxWidth: .infinity, alignment: .leading)
-                Text("5 min").frame(maxWidth: .infinity, alignment: .center)
-                Text("now").frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .font(.system(size: 9)).foregroundStyle(.secondary)
-            .padding(.trailing, HistoryChart.axisWidth)
+            Text(caption(temperaturePeak: temperatures.max(), fanPeak: fanPeak))
+                .font(.caption).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(showsFan ? "Temperature and fan history for the last 10 minutes" : "Temperature history for the last 10 minutes")
-        .accessibilityValue(summary(temperaturePeak: temperatures.max(), fanPeak: showsFan ? fanPeak : nil))
+        .accessibilityValue(caption(temperaturePeak: temperatures.max(), fanPeak: fanPeak))
     }
-    private func summary(temperaturePeak: Double?, fanPeak: Double?) -> String {
-        var parts: [String] = []
-        if let temperaturePeak { parts.append("Peak temperature \(Self.degrees(temperaturePeak))") }
-        if let fanPeak { parts.append("peak fan speed \(Int(fanPeak.rounded()).formatted()) RPM") }
-        return parts.joined(separator: ", ")
-    }
-    private func legend(_ title: String, _ color: Color, _ value: String?) -> some View {
-        HStack(spacing: 4) {
-            Circle().fill(color).frame(width: 7, height: 7)
-            Text(title).foregroundStyle(.secondary)
-            Text(value ?? "—").monospacedDigit()
+    private func graph(_ layout: GraphGeometry, _ series: [(values: [Double?], color: Color)]) -> some View {
+        let points = series.map { layout.points($0.values, interval: interval) }
+        return ZStack(alignment: .topLeading) {
+            ForEach(series.indices, id: \.self) { index in
+                graphLine(points[index]).stroke(series[index].color, style: .graphLine)
+            }
+            if let hovered = pointer.hovered, samples.indices.contains(hovered) {
+                hoverLine(layout.x(age: layout.age(hovered, count: samples.count, interval: interval)), in: layout.plot)
+                ForEach(series.indices, id: \.self) { index in
+                    if let point = points[index][hovered] { hoverMarker(point, series[index].color) }
+                }
+            }
         }
+        .graphHover(layout, count: samples.count, interval: interval, hovered: $pointer.hovered)
+    }
+    /// The readings under the pointer, or the peaks.
+    private func caption(temperaturePeak: Double?, fanPeak: Double?) -> String {
+        func fan(_ rpm: Double?) -> String { rpm.map { "\(Int($0.rounded()).formatted()) RPM" } ?? "—" }
+        func degrees(_ value: Double?) -> String { value.map { "\(Int($0.rounded()))°C" } ?? "—" }
+        if let hovered = pointer.hovered, samples.indices.contains(hovered) {
+            let sample = samples[hovered]
+            return ([TimeTick.ago(Double(samples.count - 1 - hovered) * interval), "CPU \(degrees(sample.cpu))", "GPU \(degrees(sample.gpu))"]
+                    + (showsFan ? ["Fan \(fan(sample.fan))"] : [])).joined(separator: " · ")
+        }
+        return (["Last 10 min"] + [temperaturePeak.map { "peak \(degrees($0))" }, showsFan ? fanPeak.map { "fan peak \(fan($0))" } : nil]
+            .compactMap { $0 }).joined(separator: " · ")
     }
     static func degrees(_ value: Double) -> String { "\(Int(value.rounded()))°" }
     static func rpm(_ value: Double) -> String {
         value < 1000 ? "\(Int(value))" : "\((value / 1000).formatted(.number.precision(.fractionLength(0...1))))k"
-    }
-    static func ago(seconds: Int) -> String {
-        seconds < 60 ? "\(seconds)s ago" : "\(seconds / 60)m \(String(format: "%02d", seconds % 60))s ago"
-    }
-    /// Fits the readings with some headroom, in steps of 10°C (20°C for a wide spread), at least two steps tall.
-    static func temperatureScale(_ values: [Double]) -> (range: ClosedRange<Double>, ticks: [Double]) {
-        guard let low = values.min(), let high = values.max() else { return (40...60, [40, 50, 60]) }
-        let step: Double = high - low > 30 ? 20 : 10
-        let lower = ((low - 2) / step).rounded(.down) * step
-        let upper = max(((high + 2) / step).rounded(.up) * step, lower + 2 * step)
-        return (lower...upper, Array(stride(from: lower, through: upper, by: step)))
-    }
-    /// Zero to the fans' maximum, rounded up to at most two even steps.
-    static func fanScale(maximum: Double) -> (range: ClosedRange<Double>, ticks: [Double]) {
-        let step = [500.0, 1000, 1500, 2000, 2500, 3000, 4000, 5000].first { (maximum / $0).rounded(.up) <= 2 } ?? (maximum / 2).rounded(.up)
-        let upper = (maximum / step).rounded(.up) * step
-        return (0...upper, Array(stride(from: 0, through: upper, by: step)))
     }
 }
 
@@ -1588,7 +1483,7 @@ extension Color {
     }
 }
 extension NSColor {
-    /// A fan at normal speed keeps the menu bar's own text colour; only temperatures turn green.
+    /// A fan at normal speed keeps the menu bar's own text color; only temperatures turn green.
     static func heat(_ level: HeatLevel, _ reading: TemperatureReading) -> NSColor {
         switch level {
         case .normal: return reading == .fan ? .labelColor : .systemGreen
@@ -1613,11 +1508,11 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         item.button?.target = self; item.button?.action = #selector(statusItemClicked)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         popover.behavior = .transient
-        let host = NSHostingController(rootView: ControlsView(model: model, quit: { [weak self] in self?.quitApp() },
+        let host = NSHostingController(rootView: PopoverView(model: model, quit: { [weak self] in self?.quitApp() },
                                                               openSettings: { [weak self] in self?.openSettings() }))
         host.sizingOptions = .preferredContentSize
         popover.contentViewController = host
-        model.onMenuBarLayoutChange = { [weak self] in self?.layoutPending = true; self?.refreshStatusItem() }
+        model.onLayoutChange = { [weak self] in self?.layoutPending = true; self?.refreshStatusItem() }
         model.onUpdate = { [weak self] in self?.refreshStatusItem(); self?.runQueuedCommands() }
         model.confirmRemote = { [weak self] mode, rpm, starts in self?.confirmRemote(mode, rpm: rpm, startsSession: starts) ?? false }
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.model.refresh() }
@@ -1659,7 +1554,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         runQueuedCommands()
     }
     private var confirming = false
-    /// Asks before a link, Shortcut or command starts cooling, so a web page can't raise the password prompt on its own,
+    /// Asks before a link, Shortcut, or command starts cooling, so a web page can't raise the password prompt on its own,
     /// or picks a manual speed, so it can't slow the fans on its own.
     private func confirmRemote(_ mode: FanMode, rpm: Double?, startsSession: Bool) -> Bool {
         // One question at a time; requests that arrive meanwhile are declined.
@@ -1676,11 +1571,11 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         let alert = NSAlert()
         if startsSession {
             alert.messageText = "Start \(name) cooling?"
-            alert.informativeText = "A link, Shortcut or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
+            alert.informativeText = "A link, Shortcut, or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
             alert.addButton(withTitle: "Start")
         } else {
             alert.messageText = "Switch to \(name)?"
-            alert.informativeText = "A link, Shortcut or command asked Baadgir to change the fan speed. Manual can run the fans slower than macOS would."
+            alert.informativeText = "A link, Shortcut, or command asked Baadgir to change the fan speed. Manual can run the fans slower than macOS would."
             alert.addButton(withTitle: "Switch")
         }
         alert.addButton(withTitle: "Cancel")
@@ -1763,8 +1658,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private var stackedFont: NSFont { .monospacedSystemFont(ofSize: 10, weight: .medium) }
     /// A temperature stacked over the fan speed gets a larger font; the four-digit RPM keeps the small one.
     private var stackedLargeFont: NSFont { .monospacedSystemFont(ofSize: 11.5, weight: .medium) }
-    /// The fan symbol (unless hidden), then readings two to a column: "C 72°" over "G 64°". Not a template image, so the heat colours
-    /// show; label colours resolve when the menu bar draws it, so it follows the menu bar's light or dark appearance.
+    /// The fan symbol (unless hidden), then readings two to a column: "C 72°" over "G 64°". Not a template image, so the heat colors
+    /// show; label colors resolve when the menu bar draws it, so it follows the menu bar's light or dark appearance.
     private func stackedImage(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSImage {
         let font = stackedFont, height = NSStatusBar.system.thickness
         func width(_ text: String, _ font: NSFont) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
@@ -1796,7 +1691,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             var x = fanWidth
             for (lines, columnWidth) in zip(columns, columnWidths) {
                 // Lines are stacked by their digits' cap height, not the font's line height, so the larger font still fits.
-                // A column with one reading is centred vertically.
+                // A column with one reading is centered vertically.
                 var capTop = (height - lines.map(\.font.capHeight).reduce(0, +) - CGFloat(lines.count - 1) * lineGap) / 2
                 for entry in lines {
                     let baseline = capTop + entry.font.capHeight

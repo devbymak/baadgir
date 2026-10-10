@@ -106,7 +106,7 @@ struct PowerReadings {
 
 enum ThermalLevel { case nominal, fair, serious, critical, unknown }
 
-/// Display colour band for a reading: green, yellow, red.
+/// Display color band for a reading: green, yellow, red.
 enum HeatLevel: Int, Comparable {
     case normal, warm, hot
     static func < (a: HeatLevel, b: HeatLevel) -> Bool { a.rawValue < b.rawValue }

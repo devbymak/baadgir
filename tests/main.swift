@@ -110,14 +110,14 @@ let rejected = AutomaticRestoration.restore(keys: ["F0md"], readMode: { _ in 1 }
     writeAutomatic: { _ in throw Failure("Write rejected") }, retryDelay: {})
 check(!rejected, "Report failure when automatic control cannot be restored")
 check(TemperatureReading.cpu.level(69) == .normal && TemperatureReading.cpu.level(70) == .warm &&
-      TemperatureReading.cpu.level(85) == .hot, "CPU colour bands")
+      TemperatureReading.cpu.level(85) == .hot, "CPU color bands")
 check(TemperatureReading.battery.level(34) == .normal && TemperatureReading.battery.level(35) == .warm &&
-      TemperatureReading.battery.level(40) == .hot, "Battery colour bands")
+      TemperatureReading.battery.level(40) == .hot, "Battery color bands")
 check(HeatLevel.normal.raised(by: .fair) == .warm && HeatLevel.hot.raised(by: .fair) == .hot &&
       HeatLevel.normal.raised(by: .serious) == .hot && HeatLevel.warm.raised(by: .nominal) == .warm,
-      "Thermal pressure only raises the colour")
+      "Thermal pressure only raises the color")
 check(TemperatureReading.ssd.level(54) == .normal && TemperatureReading.ssd.level(55) == .warm &&
-      TemperatureReading.ssd.level(70) == .hot, "SSD colour bands")
+      TemperatureReading.ssd.level(70) == .hot, "SSD color bands")
 let withSSD = try Temperatures(cpu: [50], gpu: [50], ssd: [41, 48])
 check(TemperatureReading.ssd.value(in: withSSD) == 48 && withSSD.highest == 50, "SSD is shown but not part of CPU/GPU hottest")
 rejects("Invalid SSD sensor") { _ = try Temperatures(cpu: [50], gpu: [50], ssd: [.nan]) }
@@ -221,11 +221,11 @@ check(TemperatureReading.fan.text(2496.4, compact: false) == "2496 RPM" && Tempe
       "Menu bar text uses RPM for the fan and °C for temperatures")
 check(TemperatureReading.fan.level(6000) == nil && TemperatureReading.fan.value(in: normal) == nil &&
       TemperatureReading.fan.text(TemperatureReading.fan.widest, compact: true).count >= 4,
-      "Fan speed has no temperature colour, isn't a temperature, and reserves four digits")
+      "Fan speed has no temperature color, isn't a temperature, and reserves four digits")
 check(TemperatureReading.fanLevel(2400, minimum: 1000, maximum: 4000) == .normal &&
       TemperatureReading.fanLevel(2500, minimum: 1000, maximum: 4000) == .warm &&
       TemperatureReading.fanLevel(3400, minimum: 1000, maximum: 4000) == .hot &&
-      TemperatureReading.fanLevel(2000, minimum: 0, maximum: 0) == nil, "Fan speed colour bands follow the fans' range")
+      TemperatureReading.fanLevel(2000, minimum: 0, maximum: 0) == nil, "Fan speed color bands follow the fans' range")
 let userFile = NSTemporaryDirectory() + "baadgir-test-" + UUID().uuidString
 FileManager.default.createFile(atPath: userFile, contents: Data())
 check(isRootOwned("/bin/sh") && !isRootOwned(userFile) && !isRootOwned("/bin") && !isRootOwned("bin/sh") &&
@@ -257,4 +257,13 @@ check(TemperatureReading.shown([.cpu, .fan], fanless: true) == [.cpu] && Tempera
 rejects("An unknown chip gets no Manual or Curve") { try SensorKeys.requireKnown(nil) }
 try SensorKeys.Generation.allCases.forEach { try SensorKeys.requireKnown($0) }
 checks += 1
+// Graph axes, shared with Jarian
+check(GraphScale(peak: 6000, minimum: 1000).ticks == [0, 2000, 4000, 6000], "Fan axis ends at the fans' maximum")
+check(GraphScale(peak: 5500, minimum: 1000).top == 6000 && GraphScale(peak: 7200, minimum: 1000).top == 7500, "Fan axis rounds up")
+check(GraphScale(low: 43, high: 67, span: 20, intervals: 4).ticks == [40, 50, 60, 70], "Temperature axis in 10° steps")
+check(GraphScale(low: 38, high: 97, span: 20, intervals: 4).ticks == [20, 40, 60, 80, 100], "A wide spread takes 20° steps")
+check(GraphScale(low: 48, high: 52, span: 20, intervals: 4).ticks == [40, 50, 60, 70], "A steady reading still gets a 20° range")
+check(GraphScale(low: .nan, high: .infinity, span: 20).ticks.count >= 2, "Invalid readings never crash the axis")
+check(TimeTick.ticks(span: 600).map(\.label) == ["Now", "2 min", "4 min", "6 min", "8 min", "10 min"], "Ten-minute axis")
+check(TimeTick.ago(1) == "Now" && TimeTick.ago(25) == "25 s ago" && TimeTick.ago(185) == "3 min 5 s ago", "Hover ages")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
