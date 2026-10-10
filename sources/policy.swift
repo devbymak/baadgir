@@ -317,6 +317,8 @@ struct Heartbeat {
 struct CoolingPolicy {
     /// The helper returns fans to Auto when the app stops refreshing its target for this long.
     static let heartbeatTimeout = 10.0
+    /// The watchdog kills the helper and restores Auto when the helper's loop stalls for this long.
+    static let helperStallTimeout = 15.0
     // Conservative software cutoffs, not manufacturer-certified limits.
     static let startLimit = 75.0
     static let stopLimit = 80.0
@@ -399,9 +401,7 @@ enum RemoteCommand: Equatable {
         case "curve": self = .curve
         case "max", "maximum": self = .maximum
         case "manual":
-            guard let rpm else { self = .manual(rpm: nil); return }
-            guard let value = Double(rpm), value.isFinite else { throw Failure("Invalid RPM in link: \(rpm)") }
-            self = .manual(rpm: value)
+            self = .manual(rpm: try rpm.map(Self.rpm))
         default: throw Failure("Unknown Baadgir command: \(name)")
         }
     }
@@ -413,10 +413,17 @@ enum RemoteCommand: Equatable {
         case ["max"], ["maximum"]: self = .maximum
         case ["manual"]: self = .manual(rpm: nil)
         case let words where words.count == 2 && words[0] == "manual":
-            guard let rpm = Double(words[1]), rpm.isFinite else { throw Failure("Invalid RPM: \(words[1])") }
-            self = .manual(rpm: rpm)
+            self = .manual(rpm: try Self.rpm(words[1]))
         default: throw Failure("Unknown command")
         }
+    }
+    /// Above any fan's range, so the app can name the real limits, yet small enough to round to a whole number.
+    static let rpmLimit = 20_000.0
+    private static func rpm(_ text: String) throws -> Double {
+        guard let value = Double(text), value.isFinite, value >= 0, value <= rpmLimit else {
+            throw Failure("Invalid RPM: \(text)")
+        }
+        return value
     }
     var url: URL {
         switch self {

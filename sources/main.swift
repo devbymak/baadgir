@@ -286,6 +286,16 @@ func coolingSession(parent: pid_t, directory: String) throws {
     // Started before any fan is touched; it restores Auto even if this process is force-killed.
     let watchdog = try startWatchdog(executable: helperPath)
     defer { close(watchdog) }
+    // A gone watchdog shows up as a write error rather than a signal; a full pipe never blocks the loop.
+    signal(SIGPIPE, SIG_IGN)
+    _ = fcntl(watchdog, F_SETFL, O_NONBLOCK)
+    /// Tells the watchdog the loop is still running; it takes over if these stop.
+    func pulse() throws {
+        var byte: UInt8 = 1
+        guard write(watchdog, &byte, 1) == 1 || errno == EAGAIN else {
+            throw Failure("The safety watchdog stopped; returning to automatic cooling")
+        }
+    }
     // Tells the app the session is live; in Curve mode the fans may stay automatic for a long time.
     let marker = openat(folder, "running", O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o644)
     if marker >= 0 { close(marker) }
@@ -321,6 +331,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
             let now = clock.now
             if previous.duration(to: now) > .seconds(3) || cancelled() { break }
             previous = now
+            try pulse()
             let target = try requestedTarget()
             let wasManual = previousTarget.isManual
             previousTarget = target
@@ -413,25 +424,36 @@ func startWatchdog(executable: String) throws -> Int32 {
     guard result == 0 else { close(fds[1]); throw Failure("Cannot start the safety watchdog") }
     return fds[1]
 }
-/// Waits for the helper to exit, then makes sure no fan is left in manual mode.
+/// Waits for the helper to exit or stall, then makes sure no fan is left in manual mode.
 func watchdog() {
     signal(SIGHUP, SIG_IGN); signal(SIGINT, SIG_IGN)
+    // The helper spawned this process; read now, before a helper exit hands it to launchd.
+    let helper = getppid()
+    var input = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
     var byte: UInt8 = 0
+    var stalled = false
     while true {
+        let ready = poll(&input, 1, Int32(CoolingPolicy.helperStallTimeout * 1000))
+        if ready == 0 { stalled = true; break }
+        if ready < 0 { if errno == EINTR { continue } else { break } }
         let count = read(STDIN_FILENO, &byte, 1)
         if count == 0 || (count < 0 && errno != EINTR) { break }
     }
+    // The pipe is still open, so the helper is alive but stuck, possibly holding fans at a stale speed.
+    if stalled, helper > 1 { kill(helper, SIGKILL) }
     // The helper's lock may close a moment after the pipe, and the SMC can fail briefly; keep trying for a few seconds.
     for _ in 0..<30 {
         do { try restoreAutomatic(); return } catch { usleep(100_000) }
     }
+    // A helper stuck inside the kernel can't exit and keeps its lock; restore without it rather than leave fans manual.
+    if stalled { try? restoreAutomatic(locking: false) }
 }
 let lockBusy = "A cooling session is already running"
 /// Returns fans left in manual mode (for example after a crash or by another app) to Auto.
-func restoreAutomatic() throws {
+func restoreAutomatic(locking: Bool = true) throws {
     try requireRootHelper()
-    let lock = try acquireLock()
-    defer { close(lock) }
+    let lock = locking ? try acquireLock() : -1
+    defer { if lock >= 0 { close(lock) } }
     let smc = try SMC()
     let manual = try smc.fans().filter { $0.mode == 1 }
     guard AutomaticRestoration.restore(keys: manual.map(\.modeKey),
@@ -520,25 +542,30 @@ final class CoolingModel: ObservableObject {
     @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
+    /// Asks in Baadgir before a request from outside starts cooling. Nil or false declines.
+    var confirmRemoteStart: ((FanMode) -> Bool)?
     /// Runs a request from a link, Shortcuts, or the command line, with the same checks as the popover.
     func perform(_ command: RemoteCommand) {
         guard allowsLinks else {
             message = "Links, Shortcuts and the command line are turned off in Settings."; onUpdate?(); return
         }
+        let wanted: FanMode
         switch command {
-        case .auto: select(.auto)
-        case .curve: select(.curve)
-        case .maximum: select(.maximum)
+        case .auto: wanted = .auto
+        case .curve: wanted = .curve
+        case .maximum: wanted = .maximum
         case .manual(let rpm):
-            if let rpm {
-                guard sliderRange.contains(rpm) else {
-                    message = "Choose a speed within \(Int(sliderRange.lowerBound))–\(Int(sliderRange.upperBound)) RPM."
-                    onUpdate?(); return
-                }
-                selectedRPM = rpm
+            if let rpm, !sliderRange.contains(rpm) {
+                message = "Choose a speed within \(Int(sliderRange.lowerBound))–\(Int(sliderRange.upperBound)) RPM."
+                onUpdate?(); return
             }
-            select(.manual)
+            wanted = .manual
         }
+        // Any web page can open a link. Starting cooling raises the administrator prompt, so it needs a click here first;
+        // switching modes inside a running session and returning to Auto don't.
+        if wanted != .auto, !sessionRunning, confirmRemoteStart?(wanted) != true { return }
+        if case .manual(let rpm?) = command { selectedRPM = rpm }
+        select(wanted)
     }
     @Published var rules = PowerRules(
         autoOnBattery: UserDefaults.standard.bool(forKey: "autoOnBattery"),
@@ -595,9 +622,11 @@ final class CoolingModel: ObservableObject {
     private func curveChanged() {
         guard initializedLimits, !fillingCurve, let bounds else { return }
         do {
-            let temperatures = curveTemperatureTexts.map { Double($0) }, speeds = curveRPMTexts.map { Double($0) }
-            guard !temperatures.contains(nil), !speeds.contains(nil) else { throw Failure("Enter a number in every field") }
-            let edited = try FanCurve(zip(temperatures, speeds).map { FanCurve.Point(temperature: $0!, rpm: $1!) })
+            // Whole numbers only: the helper receives the curve as whole numbers, so it checks exactly what is shown here.
+            let whole = { (text: String) in Int(text.trimmingCharacters(in: .whitespaces)) }
+            let temperatures = curveTemperatureTexts.map(whole), speeds = curveRPMTexts.map(whole)
+            guard !temperatures.contains(nil), !speeds.contains(nil) else { throw Failure("Enter a whole number in every field") }
+            let edited = try FanCurve(zip(temperatures, speeds).map { FanCurve.Point(temperature: Double($0!), rpm: Double($1!)) })
             try edited.validate(hardware: bounds)
             curve = edited; curveError = nil
             defaults.set(edited.points.flatMap { [Int($0.temperature), Int($0.rpm)] }, forKey: "curvePoints")
@@ -863,7 +892,8 @@ final class CoolingModel: ObservableObject {
               FileManager.default.contentsEqual(atPath: executable, andPath: helperPath) else {
             message = "The fan-control helper doesn't match this Baadgir. Run ./build.sh --install."; return false
         }
-        let command = ([helperPath] + arguments).map(shellQuote).joined(separator: " ")
+        // An empty environment: nothing set for this user's apps (such as via `launchctl setenv`) reaches root.
+        let command = (["/usr/bin/env", "-i", helperPath] + arguments).map(shellQuote).joined(separator: " ")
         let literal = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -1290,6 +1320,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         popover.contentViewController = host
         model.onMenuBarLayoutChange = { [weak self] in self?.layoutPending = true; self?.refreshStatusItem() }
         model.onUpdate = { [weak self] in self?.refreshStatusItem(); self?.runQueuedCommands() }
+        model.confirmRemoteStart = { [weak self] mode in self?.confirmStart(mode) ?? false }
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.model.refresh() }
         RunLoop.main.add(timer!, forMode: .common)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
@@ -1327,6 +1358,28 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             catch { model.message = String(describing: error); showMessage() }
         }
         runQueuedCommands()
+    }
+    private var confirming = false
+    /// Asks before a link, Shortcut or command starts cooling, so a web page can't raise the password prompt on its own.
+    private func confirmStart(_ mode: FanMode) -> Bool {
+        // One question at a time; requests that arrive meanwhile are declined.
+        guard !confirming else { return false }
+        let name: String
+        switch mode {
+        case .curve: name = "Curve"
+        case .manual: name = "Manual"
+        case .maximum: name = "Max"
+        case .auto: return true
+        }
+        confirming = true
+        defer { confirming = false }
+        let alert = NSAlert()
+        alert.messageText = "Start \(name) cooling?"
+        alert.informativeText = "A link, Shortcut or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
+        alert.addButton(withTitle: "Start \(name)")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
     /// Waits for the first sensor read so a link that launched the app isn't refused for missing readings.
     private func runQueuedCommands() {
@@ -1626,11 +1679,13 @@ if arguments.contains("--probe") || arguments.dropFirst() == ["status"] {
     if geteuid() == 0 { watchdog() }
 } else if arguments.count == 2 && arguments[1] == "--restore" {
     do { try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
-} else if arguments.count >= 2, let command = try? RemoteCommand(arguments: Array(arguments.dropFirst())) {
-    exit(send(command))
 } else if arguments.count >= 2, !arguments[1].hasPrefix("-") {
     // Plain words are commands; anything starting with "-" may come from macOS when it launches the app.
-    fputs(usage + "\n", stderr); exit(arguments[1] == "help" ? 0 : 2)
+    do { exit(send(try RemoteCommand(arguments: Array(arguments.dropFirst())))) }
+    catch {
+        if arguments[1].lowercased() == "manual" { fputs("\(error)\n", stderr) }
+        fputs(usage + "\n", stderr); exit(arguments[1] == "help" ? 0 : 2)
+    }
 } else if NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
             .contains(where: { $0.processIdentifier != getpid() }) {
     // Two copies would delete each other's session folders and fight over the fans.

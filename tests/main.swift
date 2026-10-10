@@ -186,12 +186,15 @@ for (text, command) in [("baadgir://auto", RemoteCommand.auto), ("baadgir://curv
     try check(try RemoteCommand(url: URL(string: text)!) == command, "Link \(text)")
     try check(try RemoteCommand(url: command.url) == command, "Link round trip \(text)")
 }
-for text in ["https://max", "baadgir://off", "baadgir://manual?rpm=fast", "baadgir://manual?rpm=nan", "baadgir:max"] {
+for text in ["https://max", "baadgir://off", "baadgir://manual?rpm=fast", "baadgir://manual?rpm=nan", "baadgir:max",
+             "baadgir://manual?rpm=1e20", "baadgir://manual?rpm=-1"] {
     rejects("Bad link \(text)") { _ = try RemoteCommand(url: URL(string: text)!) }
 }
 try check(try RemoteCommand(arguments: ["manual", "2500"]) == .manual(rpm: 2500), "Command-line manual speed")
 try check(try RemoteCommand(arguments: ["MAX"]) == .maximum, "Command-line words ignore case")
-for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["off"]] {
+try check(try RemoteCommand(url: RemoteCommand(arguments: ["manual", "20000"]).url) == .manual(rpm: 20000),
+          "The largest accepted speed still forms a link")
+for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["off"], ["manual", "1e20"], ["manual", "inf"]] {
     rejects("Bad command \(words)") { _ = try RemoteCommand(arguments: words) }
 }
 var rules = PowerRules()
