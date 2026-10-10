@@ -265,6 +265,28 @@ struct CoolingPolicy {
     }
 }
 
+/// Fixed-size, oldest-first history kept in memory only. Never written to disk.
+struct RingBuffer<Element> {
+    let capacity: Int
+    private var storage: [Element] = []
+    private var start = 0
+    init(capacity: Int) { precondition(capacity > 0); self.capacity = capacity }
+    var count: Int { storage.count }
+    mutating func append(_ element: Element) {
+        if storage.count < capacity { storage.append(element); return }
+        storage[start] = element
+        start = (start + 1) % capacity
+    }
+    var elements: [Element] { Array(storage[start...] + storage[..<start]) }
+}
+
+/// One second of readings for the popover's history graphs. Nil where a reading was unavailable.
+struct HistorySample {
+    let cpu: Double?
+    let gpu: Double?
+    let fan: Double?
+}
+
 struct SMCValue {
     static func decode(type: String, bytes: [UInt8]) throws -> Double {
         let value: Double

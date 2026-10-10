@@ -417,6 +417,11 @@ final class CoolingModel: ObservableObject {
         content.body = reason
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
+    /// The last ten minutes of readings, one per second. Memory only.
+    @Published private(set) var history = RingBuffer<HistorySample>(capacity: 600)
+    @Published var showsHistory = UserDefaults.standard.object(forKey: "showsHistory") as? Bool ?? true {
+        didSet { defaults.set(showsHistory, forKey: "showsHistory") }
+    }
     @Published var colorsTemperatures = UserDefaults.standard.object(forKey: "colorsTemperatures") as? Bool ?? true {
         didSet { defaults.set(colorsTemperatures, forKey: "colorsTemperatures"); onUpdate?() }
     }
@@ -565,6 +570,8 @@ final class CoolingModel: ObservableObject {
             DispatchQueue.main.async {
                 self.reading = false
                 self.fans = fans; self.temperatures = temperatures; self.sensorError = errorMessage
+                self.history.append(HistorySample(cpu: temperatures?.cpu, gpu: temperatures?.gpu,
+                    fan: fans.isEmpty ? nil : fans.map { Double($0.rpm) }.reduce(0, +) / Double(fans.count)))
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
                 if !self.initializedLimits, let bounds = self.bounds { self.loadLimits(bounds) }
                 if self.sessionRunning, self.pending != nil, self.stopRequested == false, let directory = self.directory,
@@ -753,6 +760,7 @@ struct ControlsView: View {
                 Text(model.thermalText).foregroundStyle(thermalColor)
             }
             .font(.caption)
+            if model.showsHistory { HistoryView(samples: model.history.elements, fanMaximum: model.bounds?.maximum) }
             ForEach(model.fans, id: \.index) { fan in
                 HStack {
                     Text("Fan \(fan.index + 1)")
@@ -879,6 +887,7 @@ struct SettingsView: View {
                         .disabled(model.menuBarReadings == [reading])  // At least one reading stays on.
                 }
                 Toggle("Color temperatures green, yellow and red", isOn: $model.colorsTemperatures)
+                Toggle("Show the last 10 minutes in the popover", isOn: $model.showsHistory)
             } header: {
                 Text("Menu Bar")
             } footer: {
@@ -929,6 +938,73 @@ struct SettingsView: View {
         .frame(width: 440)
         .onAppear { model.refreshLoginItemStatus() }
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Line through the values scaled to `range`; nil values leave gaps.
+struct Sparkline: Shape {
+    let values: [Double?]
+    let range: ClosedRange<Double>
+    let capacity: Int
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        var drawing = false
+        let span = max(range.upperBound - range.lowerBound, 1)
+        // Newest sample at the right edge, so a fresh history grows in from the right.
+        let offset = capacity - values.count
+        for (index, value) in values.enumerated() {
+            guard let value else { drawing = false; continue }
+            let clamped = min(max(value, range.lowerBound), range.upperBound)
+            let point = CGPoint(x: rect.minX + rect.width * CGFloat(index + offset) / CGFloat(max(capacity - 1, 1)),
+                                y: rect.maxY - rect.height * CGFloat((clamped - range.lowerBound) / span))
+            if drawing { path.addLine(to: point) } else { path.move(to: point); drawing = true }
+        }
+        return path
+    }
+}
+
+/// Ten-minute CPU/GPU temperature and fan speed graphs.
+struct HistoryView: View {
+    let samples: [HistorySample]
+    let fanMaximum: Double?
+    private let capacity = 600
+    var body: some View {
+        let temperatures = samples.flatMap { [$0.cpu, $0.gpu] }.compactMap { $0 }
+        let temperatureRange = 30...max(90, (temperatures.max() ?? 0) + 5)
+        let fanPeak = samples.compactMap(\.fan).max()
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Last 10 minutes").foregroundStyle(.secondary)
+                Spacer()
+                legend("CPU", .orange); legend("GPU", .purple)
+                if let peak = temperatures.max() { Text("peak \(Int(peak.rounded()))°C").foregroundStyle(.secondary) }
+            }
+            .font(.caption)
+            ZStack {
+                Sparkline(values: samples.map(\.cpu), range: temperatureRange, capacity: capacity).stroke(.orange, lineWidth: 1.5)
+                Sparkline(values: samples.map(\.gpu), range: temperatureRange, capacity: capacity).stroke(.purple, lineWidth: 1.5)
+            }
+            .frame(height: 36)
+            .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
+            HStack {
+                legend("Fan", .teal)
+                Spacer()
+                if let fanPeak { Text("peak \(Int(fanPeak.rounded()).formatted()) RPM").foregroundStyle(.secondary) }
+            }
+            .font(.caption)
+            Sparkline(values: samples.map(\.fan), range: 0...(fanMaximum ?? max(fanPeak ?? 1, 1)), capacity: capacity)
+                .stroke(.teal, lineWidth: 1.5)
+                .frame(height: 24)
+                .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Temperature and fan history for the last 10 minutes")
+    }
+    private func legend(_ title: String, _ color: Color) -> some View {
+        HStack(spacing: 3) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(title).foregroundStyle(.secondary)
+        }
     }
 }
 

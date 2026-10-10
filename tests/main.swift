@@ -161,4 +161,9 @@ check(controller.targets(desired: 3000, actual: [6000, 5800], maximums: [6000, 5
       "Leaving maximum also ramps down")
 check(controller.targets(desired: 5950, actual: [3000, 3000], maximums: [6000, 5800], now: 21.5) == [5950, 5800],
       "Rising curve applies immediately")
+var ring = RingBuffer<Int>(capacity: 3)
+for value in 1...2 { ring.append(value) }
+check(ring.elements == [1, 2], "History keeps order before it fills")
+for value in 3...7 { ring.append(value) }
+check(ring.elements == [5, 6, 7] && ring.count == 3, "History drops the oldest samples once full")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
