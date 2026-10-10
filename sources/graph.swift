@@ -1,4 +1,4 @@
-// Shared by Baadgir and Jarian, so their graphs look and behave the same. Keep both copies identical.
+// Graph axes, layout, and drawing for the temperature and fan graphs.
 import SwiftUI
 
 /// A graph's value axis: from a round `bottom` up to a round `top`, in equal round steps.
@@ -15,23 +15,29 @@ struct GraphScale: Equatable {
     /// The smallest step of 1, 2, 2.5, or 5 × 10ⁿ that fits `low` to `high` in at most `intervals` steps, with every tick
     /// on a multiple of the step. `span` is the least range shown above `low`.
     init(low: Double, high: Double, span: Double, intervals: Int = 3) {
-        let low = low.isFinite ? low : 0
-        let high = max(high.isFinite ? high : low, low + max(span.isFinite ? span : 0, 0))
+        // Kept far inside Double's range, so round steps above them, and the range itself, never overflow to infinity.
+        let limit = Double.greatestFiniteMagnitude / 1e6
+        let low = min(max(low.isFinite ? low : 0, -limit), limit)
+        let high = min(max(high.isFinite ? high : low, low + max(span.isFinite ? span : 0, 0)), limit)
         let intervals = Double(max(intervals, 1))
         var magnitude = pow(10, floor(log10(max(high - low, .leastNormalMagnitude) / intervals)))
-        while true {
+        // Bounded, so the search always ends: no round step fits a range around zero in one interval.
+        while magnitude > 0 && magnitude.isFinite {
             for multiple in [1, 2, 2.5, 5] {
                 let step = multiple * magnitude
                 // The tolerance stops float error from skipping a step that fits exactly.
                 let bottom = floor(low / step + 1e-9) * step
                 let top = max(ceil(high / step - 1e-9) * step, bottom + step)
-                if (top - bottom) / step <= intervals + 1e-9 {
+                // A step too small to change `bottom` would leave an axis with no height.
+                if top > bottom, (top - bottom) / step <= intervals + 1e-9 {
                     self.bottom = bottom; self.top = top; self.step = step
                     return
                 }
             }
             magnitude *= 10
         }
+        // No round step fits: show the range as it is, in one step.
+        bottom = low; step = high > low ? high - low : 1; top = bottom + step
     }
     var ticks: [Double] { (0...Int(((top - bottom) / step).rounded())).map { bottom + Double($0) * step } }
 }

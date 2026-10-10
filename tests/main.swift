@@ -265,13 +265,17 @@ check(TemperatureReading.shown([.cpu, .fan], fanless: true) == [.cpu] && Tempera
 rejects("An unknown chip gets no Manual or Curve") { try SensorKeys.requireKnown(nil) }
 try SensorKeys.Generation.allCases.forEach { try SensorKeys.requireKnown($0) }
 checks += 1
-// Graph axes, shared with Jarian
+// Graph axes
 check(GraphScale(peak: 6000, minimum: 1000).ticks == [0, 2000, 4000, 6000], "Fan axis ends at the fans' maximum")
 check(GraphScale(peak: 5500, minimum: 1000).top == 6000 && GraphScale(peak: 7200, minimum: 1000).top == 7500, "Fan axis rounds up")
 check(GraphScale(low: 43, high: 67, span: 20, intervals: 4).ticks == [40, 50, 60, 70], "Temperature axis in 10° steps")
 check(GraphScale(low: 38, high: 97, span: 20, intervals: 4).ticks == [20, 40, 60, 80, 100], "A wide spread takes 20° steps")
 check(GraphScale(low: 48, high: 52, span: 20, intervals: 4).ticks == [40, 50, 60, 70], "A steady reading still gets a 20° range")
 check(GraphScale(low: .nan, high: .infinity, span: 20).ticks.count >= 2, "Invalid readings never crash the axis")
+for scale in [GraphScale(low: -.greatestFiniteMagnitude, high: .greatestFiniteMagnitude, span: 20, intervals: 4),
+              GraphScale(low: -1, high: 1, span: 0, intervals: 1), GraphScale(low: 50, high: 50, span: 0)] {
+    check(scale.top > scale.bottom && scale.step > 0 && scale.ticks.allSatisfy(\.isFinite), "Extreme readings end with a usable axis")
+}
 check(TimeTick.ticks(span: 600).map(\.label) == ["Now", "2 min", "4 min", "6 min", "8 min", "10 min"], "Ten-minute axis")
 check(TimeTick.ago(1) == "Now" && TimeTick.ago(25) == "25 s ago" && TimeTick.ago(185) == "3 min 5 s ago", "Hover ages")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
