@@ -723,6 +723,22 @@ final class CoolingModel: ObservableObject {
         curveChanged()
     }
     func resetCurve() { if let bounds { showCurve(.standard(for: bounds)) } }
+    /// Moves one point of the running curve by hand. Kept between its neighbours and on or above the safe minimum, so
+    /// every position a drag reaches is a valid curve. Temperatures snap to whole degrees, speeds to 10 RPM.
+    func moveCurvePoint(_ index: Int, temperature: Double, rpm: Double) {
+        guard let curve, let bounds, curve.points.indices.contains(index) else { return }
+        var points = curve.points
+        let previous = index > 0 ? points[index - 1] : nil, next = index < points.count - 1 ? points[index + 1] : nil
+        let coolest = previous.map { $0.temperature + 1 } ?? FanCurve.lowestTemperature
+        let hottest = next.map { $0.temperature - 1 } ?? CoolingPolicy.stopLimit - 1
+        let degrees = min(max(temperature.rounded(), coolest), hottest)
+        // The safe minimum rises with temperature, so it never passes the next point, which already meets it.
+        let slowest = max(previous?.rpm ?? 0, SafeMinimum.rpm(at: degrees, hardware: bounds), ceil(bounds.minimum))
+        let fastest = min(next?.rpm ?? .infinity, floor(bounds.maximum))
+        points[index] = FanCurve.Point(temperature: degrees, rpm: min(max((rpm / 10).rounded() * 10, slowest), fastest))
+        guard let moved = try? FanCurve(points), moved != curve else { return }
+        showCurve(moved)
+    }
     /// What the curve asks for right now; infinity means maximum.
     var curveSpeedNow: Double? {
         guard let curve, let temperatures, let bounds else { return nil }
@@ -1093,6 +1109,9 @@ struct PopoverView: View {
                                           : "Curve wants \(Int(speed).formatted()) RPM at \(Int(model.temperatures?.highest ?? 0))°C")
                         .font(.caption).monospacedDigit()
                 }
+                if model.displayedMode == .curve, let curve = model.curve, let bounds = model.bounds {
+                    CurveEditor(model: model, curve: curve, bounds: bounds)
+                }
                 Text(explanation).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let message = model.message {
@@ -1136,7 +1155,7 @@ struct PopoverView: View {
         case .auto:
             return "macOS controls the fans. \(model.advanced ? "Curve, Manual, and Max ask" : "Curve and Max ask") for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
         case .curve:
-            return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Returns to Auto on sleep or quit."
+            return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Returns to Auto on sleep or quit."
         case .manual:
             return "Drag to change speed. Returns to Auto at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
         case .maximum:
@@ -1274,7 +1293,7 @@ struct SettingsView: View {
 
     @ViewBuilder private var fans: some View {
         Section {
-            if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
+            if let curve = model.curve, let bounds = model.bounds { CurveEditor(model: model, curve: curve, bounds: bounds, height: 160) }
             HStack {
                 Text("Point").frame(maxWidth: .infinity, alignment: .leading)
                 Text("Temperature").frame(width: 92, alignment: .trailing)
@@ -1490,51 +1509,135 @@ struct HistoryView: View {
     }
 }
 
-/// Small line drawing of the curve from 30°C to 80°C, where maximum takes over.
-struct CurvePreview: View {
+/// The fan curve on a grid from 30°C to 80°C, where maximum takes over. Drag anywhere to move the nearest point.
+struct CurveEditor: View {
+    @ObservedObject var model: CoolingModel
     let curve: FanCurve
     let bounds: HardwareBounds
+    var height: CGFloat = 120
+    /// The point being dragged, picked once when the drag starts so it can't jump to a neighbour mid-drag. An object
+    /// rather than `@State`, whose macro plugin plain swiftc can't load.
+    @StateObject private var drag = Drag()
+    final class Drag: ObservableObject { @Published var index: Int? }
+    private var dragging: Int? { drag.index }
     private let low = FanCurve.lowestTemperature, high = CoolingPolicy.stopLimit
     private func point(_ temperature: Double, _ rpm: Double, in size: CGSize) -> CGPoint {
         CGPoint(x: (temperature - low) / (high - low) * size.width,
                 y: (1 - (rpm - bounds.minimum) / (bounds.maximum - bounds.minimum)) * size.height)
     }
+    private func value(at location: CGPoint, in size: CGSize) -> (temperature: Double, rpm: Double) {
+        (low + Double(location.x / size.width) * (high - low),
+         bounds.minimum + Double(1 - location.y / size.height) * (bounds.maximum - bounds.minimum))
+    }
+    private func label(_ item: FanCurve.Point) -> String { "\(Int(item.temperature))°C · \(Int(item.rpm).formatted()) RPM" }
     var body: some View {
-        VStack(spacing: 2) {
-            graph
-            HStack {
-                Text("\(Int(low))°C")
-                Spacer()
-                Text("\(Int(high))°C · max")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 4) {
+                VStack(alignment: .trailing) {
+                    Text(HistoryView.rpm(bounds.maximum))
+                    Spacer()
+                    Text(HistoryView.rpm(bounds.minimum))
+                }
+                .frame(width: 28, alignment: .trailing)
+                graph
             }
-            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+            .frame(height: height)
+            HStack {
+                ForEach(Array(stride(from: low, through: high, by: 10)), id: \.self) { degrees in
+                    if degrees > low { Spacer(minLength: 0) }
+                    Text(degrees == high ? "\(Int(degrees))° max" : "\(Int(degrees))°")
+                }
+            }
+            .padding(.leading, 32)
+            HStack {
+                Spacer(minLength: 32)
+                Text(dragging.map { label(curve.points[$0]) } ?? "Drag a point to change the curve")
+                Spacer()
+            }
+            .foregroundStyle(dragging == nil ? .secondary : .primary)
         }
+        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
         .padding(.vertical, 4)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Fan curve preview, with the safe minimum dashed")
     }
     private var graph: some View {
         GeometryReader { geometry in
-            Path { path in
-                path.move(to: point(low, curve.rpm(at: low), in: geometry.size))
-                for item in curve.points { path.addLine(to: point(item.temperature, item.rpm, in: geometry.size)) }
-                path.addLine(to: point(high - 0.001, curve.points.last!.rpm, in: geometry.size))
-                path.addLine(to: point(high, bounds.maximum, in: geometry.size))
+            let size = geometry.size
+            ZStack(alignment: .topLeading) { chart(in: size) }
+                .frame(width: size.width, height: size.height, alignment: .topLeading)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                    if drag.index == nil {
+                        func distance(_ index: Int) -> CGFloat {
+                            let at = point(curve.points[index].temperature, curve.points[index].rpm, in: size)
+                            return hypot(at.x - gesture.startLocation.x, at.y - gesture.startLocation.y)
+                        }
+                        drag.index = curve.points.indices.min { distance($0) < distance($1) }
+                    }
+                    guard let index = drag.index else { return }
+                    let target = value(at: gesture.location, in: size)
+                    model.moveCurvePoint(index, temperature: target.temperature, rpm: target.rpm)
+                }.onEnded { _ in
+                    drag.index = nil
+                    model.heartbeat()  // Send the new curve now rather than at the next second.
+                })
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Fan curve, with the safe minimum dashed")
+    }
+    @ViewBuilder private func chart(in size: CGSize) -> some View {
+        // A grid square every 5°C and every eighth of the fan range.
+        Path { path in
+            for step in 0...10 {
+                let x = size.width * CGFloat(step) / 10
+                path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: size.height))
             }
-            .stroke(Color.accentColor, lineWidth: 2)
-            // The safe minimum, which Curve never runs below.
-            Path { path in
-                let temperatures = [low] + SafeMinimum.points.map(\.temperature) + [high]
-                path.addLines(temperatures.map { point($0, SafeMinimum.rpm(at: $0, hardware: bounds), in: geometry.size) })
-            }
-            .stroke(Color.secondary, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-            ForEach(curve.points, id: \.temperature) { item in
-                Circle().fill(Color.accentColor).frame(width: 6, height: 6)
-                    .position(point(item.temperature, item.rpm, in: geometry.size))
+            for step in 0...8 {
+                let y = size.height * CGFloat(step) / 8
+                path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: size.width, y: y))
             }
         }
-        .frame(height: 80)
-        .background(alignment: .bottom) { Divider() }
+        .stroke(Color.secondary.opacity(0.18), lineWidth: 0.5)
+        let line = [CGPoint](
+            [point(low, curve.rpm(at: low), in: size)] + curve.points.map { point($0.temperature, $0.rpm, in: size) }
+            + [point(high - 0.001, curve.points.last!.rpm, in: size), point(high, bounds.maximum, in: size)])
+        Path { path in
+            path.addLines(line)
+            path.addLine(to: CGPoint(x: size.width, y: size.height)); path.addLine(to: CGPoint(x: 0, y: size.height))
+        }
+        .fill(Color.accentColor.opacity(0.12))
+        Path { $0.addLines(line) }.stroke(Color.accentColor, lineWidth: 2)
+        // The safe minimum, which Curve never runs below.
+        Path { path in
+            let temperatures = [low] + SafeMinimum.points.map(\.temperature) + [high]
+            path.addLines(temperatures.map { point($0, SafeMinimum.rpm(at: $0, hardware: bounds), in: size) })
+        }
+        .stroke(Color.secondary, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        // Where the Mac is now.
+        if let now = model.temperatures?.highest, now >= low, now < high {
+            Path { path in
+                path.move(to: CGPoint(x: point(now, 0, in: size).x, y: 0))
+                path.addLine(to: CGPoint(x: point(now, 0, in: size).x, y: size.height))
+            }
+            .stroke(Color.orange.opacity(0.7), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+            Circle().fill(Color.orange).frame(width: 6, height: 6)
+                .position(point(now, curve.rpm(at: now), in: size))
+                .accessibilityHidden(true)
+        }
+        ForEach(curve.points.indices, id: \.self) { index in
+            let item = curve.points[index]
+            Circle().fill(Color.accentColor)
+                .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
+                .frame(width: dragging == index ? 12 : 9, height: dragging == index ? 12 : 9)
+                .position(point(item.temperature, item.rpm, in: size))
+                .accessibilityElement()
+                .accessibilityLabel("Curve point \(index + 1)")
+                .accessibilityValue(label(item))
+                .accessibilityAdjustableAction { direction in
+                    let step: Double = direction == .increment ? 100 : -100
+                    model.moveCurvePoint(index, temperature: item.temperature, rpm: item.rpm + step)
+                    model.heartbeat()
+                }
+        }
     }
 }
 
