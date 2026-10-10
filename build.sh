@@ -31,9 +31,14 @@ cat > 'Baadgir.app/Contents/Info.plist' <<'PLIST'
 </dict></array>
 </dict></plist>
 PLIST
-codesign --force --sign - 'Baadgir.app'
+# Hardened runtime: no injected libraries or debugger attachment, including in the root helper.
+codesign --force --sign - --options runtime 'Baadgir.app'
 echo 'Built Baadgir.app'
 if [[ "${1:-}" == "--install" ]]; then
+  # Fan control runs as root only from this root-owned copy, which apps running as you cannot replace.
+  # Installed first, so a cancelled password prompt leaves the running app untouched.
+  sudo mkdir -p /Library/PrivilegedHelperTools
+  sudo install -o root -g wheel -m 755 'Baadgir.app/Contents/MacOS/baadgir' /Library/PrivilegedHelperTools/local.baadgir.helper
   # Quit the running copy first; it restores automatic cooling before exiting.
   osascript -e 'if application id "local.baadgir" is running then tell application id "local.baadgir" to quit' >/dev/null
   for _ in {1..50}; do pgrep -qf '/Applications/Baadgir.app/Contents/MacOS/baadgir$' || break; sleep 0.2; done

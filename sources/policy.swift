@@ -394,6 +394,20 @@ struct SMCValue {
     }
 }
 
+/// True when `path` is a regular file and it and every folder above it are owned by root and writable only by root,
+/// so no other account or app can replace what root will run.
+func isRootOwned(_ path: String) -> Bool {
+    guard path.hasPrefix("/") else { return false }
+    var current = path
+    var info = stat()
+    guard lstat(current, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return false }
+    while true {
+        guard lstat(current, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0 else { return false }
+        if current == "/" { return true }
+        current = (current as NSString).deletingLastPathComponent
+    }
+}
+
 struct AutomaticRestoration {
     static func restore(keys: [String], readMode: (String) throws -> Double,
                         writeAutomatic: (String) throws -> Void,

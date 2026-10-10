@@ -198,4 +198,9 @@ check(rules.mode(from: .adapter, to: .adapter, current: .auto) == nil, "No chang
 check(rules.mode(from: .adapter, to: .unknown, current: .manual) == nil, "Unknown power source changes nothing")
 check(rules.blocker(for: .maximum, on: .battery) != nil && rules.blocker(for: .auto, on: .battery) == nil &&
       rules.blocker(for: .curve, on: .adapter) == nil, "Battery rule blocks only non-Auto modes on battery")
+let userFile = NSTemporaryDirectory() + "baadgir-test-" + UUID().uuidString
+FileManager.default.createFile(atPath: userFile, contents: Data())
+check(isRootOwned("/bin/sh") && !isRootOwned(userFile) && !isRootOwned("/bin") && !isRootOwned("bin/sh") &&
+      !isRootOwned("/nonexistent/helper"), "Only root-owned files in root-owned folders are trusted")
+try? FileManager.default.removeItem(atPath: userFile)
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")

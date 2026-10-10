@@ -162,6 +162,45 @@ func thermalLevel() -> ThermalLevel {
 }
 var interrupted: sig_atomic_t = 0
 func handleSignal(_ signal: Int32) { interrupted = 1 }
+/// Root-owned copy of the executable, installed by `build.sh --install`. Root never runs the app bundle's copy,
+/// which any app running as the user could replace.
+let helperPath = "/Library/PrivilegedHelperTools/local.baadgir.helper"
+/// Refuses fan control unless this process is root running the root-owned helper.
+func requireRootHelper() throws {
+    guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
+    var size: UInt32 = 0
+    _ = _NSGetExecutablePath(nil, &size)
+    var buffer = [CChar](repeating: 0, count: Int(size))
+    guard _NSGetExecutablePath(&buffer, &size) == 0, let resolved = realpath(buffer, nil) else {
+        throw Failure("Cannot locate the fan-control helper")
+    }
+    defer { free(resolved) }
+    guard String(cString: resolved) == helperPath, isRootOwned(helperPath) else {
+        throw Failure("Fan control runs only from the installed helper. Run ./build.sh --install.")
+    }
+}
+/// The user a process runs as.
+func processOwner(_ pid: pid_t) throws -> uid_t {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var request: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&request, 4, &info, &size, nil, 0) == 0, size == MemoryLayout<kinfo_proc>.stride else {
+        throw Failure("Cannot identify Baadgir's user")
+    }
+    return info.kp_eproc.e_ucred.cr_uid
+}
+/// Opens the app's session folder without following links, and checks that the app's user owns it and no one else
+/// can enter it. Root then reaches the session files only through this folder, never through a swapped path.
+func openSessionDirectory(_ path: String, owner: uid_t) throws -> Int32 {
+    let folder = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    guard folder >= 0 else { throw Failure("Cooling session folder is unavailable") }
+    var info = stat()
+    guard fstat(folder, &info) == 0, info.st_uid == owner, info.st_mode & 0o077 == 0 else {
+        close(folder)
+        throw Failure("Cooling session folder is not private to Baadgir's user")
+    }
+    return folder
+}
 func acquireLock() throws -> Int32 {
     let lock = open("/var/run/local.baadgir.lock", O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     guard lock >= 0 else { throw Failure("Cannot create cooling session lock") }
@@ -172,9 +211,9 @@ func acquireLock() throws -> Int32 {
     return lock
 }
 /// Reads the app's requested target and the control file's modification time.
-func readControl(_ path: String) throws -> (target: CoolingTarget, modified: Double) {
+func readControl(in folder: Int32) throws -> (target: CoolingTarget, modified: Double) {
     // Non-blocking so a FIFO in place of the file cannot stall the helper while fans are manual.
-    let file = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+    let file = openat(folder, "control", O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     guard file >= 0 else { throw Failure("Cooling controls are unavailable; returning to automatic cooling") }
     defer { close(file) }
     var info = stat()
@@ -188,11 +227,15 @@ func readControl(_ path: String) throws -> (target: CoolingTarget, modified: Dou
     return (try CoolingTarget(encoded: String(decoding: buffer[0..<count], as: UTF8.self)), modified)
 }
 func coolingSession(parent: pid_t, directory: String) throws {
-    guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
+    try requireRootHelper()
     let lock = try acquireLock()
     defer { close(lock) }
-    let stopPath = directory + "/stop", controlPath = directory + "/control"
-    func cancelled() -> Bool { kill(parent, 0) != 0 || FileManager.default.fileExists(atPath: stopPath) }
+    let folder = try openSessionDirectory(directory, owner: try processOwner(parent))
+    defer { close(folder) }
+    func cancelled() -> Bool {
+        var info = stat()
+        return kill(parent, 0) != 0 || fstatat(folder, "stop", &info, AT_SYMLINK_NOFOLLOW) == 0
+    }
     guard !cancelled() else { throw Failure("Cooling session was cancelled before it started") }
     let smc = try SMC()
     let fans = try smc.fans()
@@ -205,7 +248,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
     let bounds = try HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
     var heartbeat = Heartbeat()
     func requestedTarget() throws -> CoolingTarget {
-        let (target, modified) = try readControl(controlPath)
+        let (target, modified) = try readControl(in: folder)
         guard heartbeat.isFresh(stamp: modified, now: ProcessInfo.processInfo.systemUptime) else {
             throw Failure("Baadgir stopped responding; returning to automatic cooling")
         }
@@ -218,7 +261,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
         return target
     }
     // The first target must also be recent by wall clock; later checks use the monotonic heartbeat.
-    guard abs(Date().timeIntervalSince1970 - (try readControl(controlPath)).modified) <= CoolingPolicy.heartbeatTimeout else {
+    guard abs(Date().timeIntervalSince1970 - (try readControl(in: folder)).modified) <= CoolingPolicy.heartbeatTimeout else {
         throw Failure("Cooling controls are stale")
     }
     switch try requestedTarget() {
@@ -228,10 +271,10 @@ func coolingSession(parent: pid_t, directory: String) throws {
     }
     signal(SIGTERM, handleSignal); signal(SIGINT, handleSignal); signal(SIGHUP, handleSignal)
     // Started before any fan is touched; it restores Auto even if this process is force-killed.
-    let watchdog = try startWatchdog(executable: Bundle.main.executablePath ?? CommandLine.arguments[0])
+    let watchdog = try startWatchdog(executable: helperPath)
     defer { close(watchdog) }
     // Tells the app the session is live; in Curve mode the fans may stay automatic for a long time.
-    let marker = open(directory + "/running", O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o644)
+    let marker = openat(folder, "running", O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o644)
     if marker >= 0 { close(marker) }
     var touched: [Fan] = []
     func restore() -> Bool {
@@ -361,17 +404,15 @@ func watchdog() {
         let count = read(STDIN_FILENO, &byte, 1)
         if count == 0 || (count < 0 && errno != EINTR) { break }
     }
-    // The helper's lock may close a moment after the pipe.
-    for _ in 0..<20 {
-        do { try restoreAutomatic(); return }
-        catch let failure as Failure where failure.description == lockBusy { usleep(100_000) }
-        catch { return }
+    // The helper's lock may close a moment after the pipe, and the SMC can fail briefly; keep trying for a few seconds.
+    for _ in 0..<30 {
+        do { try restoreAutomatic(); return } catch { usleep(100_000) }
     }
 }
 let lockBusy = "A cooling session is already running"
 /// Returns fans left in manual mode (for example after a crash or by another app) to Auto.
 func restoreAutomatic() throws {
-    guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
+    try requireRootHelper()
     let lock = try acquireLock()
     defer { close(lock) }
     let smc = try SMC()
@@ -444,7 +485,8 @@ final class CoolingModel: ObservableObject {
     @Published var hotKeyError: String?
     var onHotKeyChange: (() -> Void)?
     /// Whether baadgir:// links (and so Shortcuts and the command line) may change the fan mode.
-    @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? true {
+    /// Off until turned on: any web page or app can open a link, and starting a session asks for the administrator password.
+    @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
     /// Runs a request from a link, Shortcuts, or the command line, with the same checks as the popover.
@@ -765,10 +807,17 @@ final class CoolingModel: ObservableObject {
             pending = "Restoring automatic cooling…"
         }
     }
-    /// Runs this executable as root through an administrator prompt. Returns false if it could not launch.
+    /// Runs the root-owned helper as root through an administrator prompt. Returns false if it could not launch.
     private func runPrivileged(_ arguments: [String], completion: @escaping (Bool, String) -> Void) -> Bool {
-        let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        let command = ([executable] + arguments).map(shellQuote).joined(separator: " ")
+        // Never hand the administrator password to a file that another app running as this user could replace.
+        guard isRootOwned(helperPath) else {
+            message = "The fan-control helper is not installed. Run ./build.sh --install."; return false
+        }
+        guard let executable = Bundle.main.executablePath,
+              FileManager.default.contentsEqual(atPath: executable, andPath: helperPath) else {
+            message = "The fan-control helper doesn't match this Baadgir. Run ./build.sh --install."; return false
+        }
+        let command = ([helperPath] + arguments).map(shellQuote).joined(separator: " ")
         let literal = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
