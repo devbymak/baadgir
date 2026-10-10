@@ -983,17 +983,6 @@ func diagnostic() -> String {
     } catch { return "Read-only diagnostic failed: \(error)" }
 }
 let arguments = CommandLine.arguments
-/// Carries preferences over once from the app's former name, Parvanak (bundle ID `local.parvanak`).
-func migrateSettings() {
-    let defaults = UserDefaults.standard
-    guard !defaults.bool(forKey: "migratedFromParvanak") else { return }
-    defaults.set(true, forKey: "migratedFromParvanak")
-    guard let old = UserDefaults(suiteName: "local.parvanak") else { return }
-    for key in ["minimumRPM", "maximumRPM", "manualRPM", "menuBarReadings", "colorsTemperatures"]
-    where defaults.object(forKey: key) == nil {
-        if let value = old.object(forKey: key) { defaults.set(value, forKey: key) }
-    }
-}
 // No logs: nothing here writes readings to disk. `--probe` prints to the terminal only.
 if arguments.contains("--probe") {
     print(diagnostic())
@@ -1007,7 +996,6 @@ if arguments.contains("--probe") {
 } else if arguments.count == 2 && arguments[1] == "--restore" {
     do { try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
 } else {
-    migrateSettings()
     let app = NSApplication.shared
     let delegate = MenuApp()
     app.delegate = delegate
