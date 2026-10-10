@@ -46,7 +46,8 @@ if [[ "${1:-}" == "--install" ]]; then
   # Quit every running copy first, wherever it was started; it restores automatic cooling before exiting. Matched by
   # bundle ID, like the app's own one-copy check, so a copy still running would also make the new one quit at launch.
   running() { [[ -n "$(lsappinfo find bundleid=local.baadgir)" ]] }
-  if running; then osascript -e 'tell application id "local.baadgir" to quit' >/dev/null; fi
+  # A refused quit request (such as a declined Automation prompt) is caught by the check below.
+  if running; then osascript -e 'tell application id "local.baadgir" to quit' >/dev/null 2>&1 || true; fi
   for _ in {1..50}; do running || break; sleep 0.2; done
   if running; then echo 'Baadgir is still running; quit it, then run ./build.sh --install again.' >&2; exit 1; fi
   rm -rf '/Applications/Baadgir.app'
