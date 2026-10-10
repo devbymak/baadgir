@@ -1,6 +1,8 @@
-# Parvanak
+# Baadgir
 
-<img src="assets/app-icon.png" width="96" alt="Parvanak icon">
+*Baadgir* (بادگیر, "windcatcher") is named after the Persian towers that cool buildings by catching the wind.
+
+<img src="assets/app-icon.png" width="96" alt="Baadgir icon">
 
 A small, open-source macOS menu bar app for temperature monitoring and fan control. Built with Swift, SwiftUI, and AppKit, with no third-party dependencies.
 
@@ -22,7 +24,7 @@ Requires an Apple silicon Mac, macOS 13+, and Xcode Command Line Tools.
 ```sh
 ./test.sh
 ./build.sh
-open Parvanak.app
+open Baadgir.app
 ```
 
 Fan control requires macOS administrator authorization. Monitoring does not.
@@ -33,7 +35,7 @@ Experimental: uses an undocumented SMC interface. Hardware control and restorati
 
 Manual speed stays within the reported hardware range, with a floor of 1000 RPM. CPU and GPU readings are required. Manual speed starts below 75°C and returns to Auto at 80°C, high thermal pressure, or sensor failure; a detected battery temperature of 45°C also ends manual control. Max has no temperature cutoff because it never lowers fan speed. The root helper returns fans to Auto if the app stops refreshing its target for 10 seconds. These are conservative software cutoffs, not certified safety limits. Your min/max settings only constrain manual speed; automatic cooling can exceed them.
 
-The app does not disable Apple's thermal services. A separate root watchdog restores Auto if the helper is force-killed; killing both, or failed hardware writes, can prevent cleanup. Restart your Mac if automatic control cannot be restored. Avoid running other fan-control apps alongside Parvanak.
+The app does not disable Apple's thermal services. A separate root watchdog restores Auto if the helper is force-killed; killing both, or failed hardware writes, can prevent cleanup. Restart your Mac if automatic control cannot be restored. Avoid running other fan-control apps alongside Baadgir.
 
 Sensor-key reference: [Stats](https://github.com/exelban/stats/blob/master/Modules/Sensors/values.swift).
 

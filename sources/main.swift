@@ -145,7 +145,7 @@ func thermalLevel() -> ThermalLevel {
 var interrupted: sig_atomic_t = 0
 func handleSignal(_ signal: Int32) { interrupted = 1 }
 func acquireLock() throws -> Int32 {
-    let lock = open("/var/run/local.parvanak.lock", O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+    let lock = open("/var/run/local.baadgir.lock", O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     guard lock >= 0 else { throw Failure("Cannot create cooling session lock") }
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
         close(lock)
@@ -189,7 +189,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
     func requestedTarget() throws -> CoolingTarget {
         let (target, modified) = try readControl(controlPath)
         guard heartbeat.isFresh(stamp: modified, now: ProcessInfo.processInfo.systemUptime) else {
-            throw Failure("Parvanak stopped responding; returning to automatic cooling")
+            throw Failure("Baadgir stopped responding; returning to automatic cooling")
         }
         if case .manual(let rpm) = target {
             try CoolingPolicy.validateRange(rpm: rpm, minimum: bounds.minimum, maximum: bounds.maximum, hardware: bounds)
@@ -368,7 +368,7 @@ final class CoolingModel: ObservableObject {
     }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
-    private let queue = DispatchQueue(label: "local.parvanak.sensors")
+    private let queue = DispatchQueue(label: "local.baadgir.sensors")
     private let defaults = UserDefaults.standard
     private var smc: SMC?
     private var reading = false
@@ -510,7 +510,7 @@ final class CoolingModel: ObservableObject {
     private var stopRequested = false
     private func startSession(_ newMode: FanMode) {
         guard helper == nil else { return }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("parvanak-" + UUID().uuidString)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("baadgir-" + UUID().uuidString)
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         catch { message = "Cannot create cooling session: \(error)"; return }
         self.directory = directory
@@ -594,7 +594,7 @@ struct ControlsView: View {
                     Image(nsImage: icon).resizable().frame(width: 36, height: 36).accessibilityHidden(true)
                 } else { Image(systemName: "fan").font(.title2).accessibilityHidden(true) }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Parvanak").font(.headline)
+                    Text("Baadgir").font(.headline)
                     Text(model.status).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -640,7 +640,7 @@ struct ControlsView: View {
             HStack {
                 Button("Settings…", action: openSettings).buttonStyle(.plain).foregroundStyle(.secondary)
                 Spacer()
-                Button("Quit Parvanak", action: quit).buttonStyle(.plain).foregroundStyle(.secondary)
+                Button("Quit Baadgir", action: quit).buttonStyle(.plain).foregroundStyle(.secondary)
             }
         }
         .padding(16)
@@ -767,10 +767,10 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var layoutPending = false
     private var symbol = "fan"
     func applicationDidFinishLaunching(_ notification: Notification) {
-        item.button?.image = NSImage(systemSymbolName: "fan", accessibilityDescription: "Parvanak")
+        item.button?.image = NSImage(systemSymbolName: "fan", accessibilityDescription: "Baadgir")
         item.button?.imagePosition = .imageLeading
         fixStatusItemWidth()
-        item.button?.setAccessibilityLabel("Parvanak temperature and fan controls")
+        item.button?.setAccessibilityLabel("Baadgir temperature and fan controls")
         item.button?.target = self; item.button?.action = #selector(statusItemClicked)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         popover.behavior = .transient
@@ -790,7 +790,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func removeStaleSessions() {
         let temporary = FileManager.default.temporaryDirectory
         for name in (try? FileManager.default.contentsOfDirectory(atPath: temporary.path)) ?? []
-        where name.hasPrefix("parvanak-") {
+        where name.hasPrefix("baadgir-") {
             try? FileManager.default.removeItem(at: temporary.appendingPathComponent(name))
         }
     }
@@ -800,9 +800,9 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wanted = model.displayedMode == .auto ? "fan" : "fan.fill"
         if wanted != symbol {
             symbol = wanted
-            item.button?.image = NSImage(systemSymbolName: wanted, accessibilityDescription: "Parvanak")
+            item.button?.image = NSImage(systemSymbolName: wanted, accessibilityDescription: "Baadgir")
         }
-        item.button?.toolTip = "Parvanak · " + model.status
+        item.button?.toolTip = "Baadgir · " + model.status
     }
     private var titleFont: NSFont { .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
     /// One reading shows " 72°C"; several show " C 72°  G 64°" with letter prefixes.
@@ -871,11 +871,11 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(entry)
         }
         menu.addItem(.separator())
-        let open = NSMenuItem(title: "Open Parvanak", action: #selector(togglePopover), keyEquivalent: "")
+        let open = NSMenuItem(title: "Open Baadgir", action: #selector(togglePopover), keyEquivalent: "")
         open.target = self; menu.addItem(open)
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self; menu.addItem(settings)
-        let quit = NSMenuItem(title: "Quit Parvanak", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Baadgir", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
         // Attach only while open so a left click still shows the popover.
         menu.delegate = self
@@ -911,7 +911,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let host = NSHostingController(rootView: SettingsView(model: model))
             host.sizingOptions = .preferredContentSize
             let window = NSWindow(contentViewController: host)
-            window.title = "Parvanak Settings"
+            window.title = "Baadgir Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.center()
@@ -952,6 +952,17 @@ func diagnostic() -> String {
     } catch { return "Read-only diagnostic failed: \(error)" }
 }
 let arguments = CommandLine.arguments
+/// Carries preferences over once from the app's former name, Parvanak (bundle ID `local.parvanak`).
+func migrateSettings() {
+    let defaults = UserDefaults.standard
+    guard !defaults.bool(forKey: "migratedFromParvanak") else { return }
+    defaults.set(true, forKey: "migratedFromParvanak")
+    guard let old = UserDefaults(suiteName: "local.parvanak") else { return }
+    for key in ["minimumRPM", "maximumRPM", "manualRPM", "menuBarReadings", "colorsTemperatures"]
+    where defaults.object(forKey: key) == nil {
+        if let value = old.object(forKey: key) { defaults.set(value, forKey: key) }
+    }
+}
 // No logs: nothing here writes readings to disk. `--probe` prints to the terminal only.
 if arguments.contains("--probe") {
     print(diagnostic())
@@ -965,6 +976,7 @@ if arguments.contains("--probe") {
 } else if arguments.count == 2 && arguments[1] == "--restore" {
     do { try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
 } else {
+    migrateSettings()
     let app = NSApplication.shared
     let delegate = MenuApp()
     app.delegate = delegate
