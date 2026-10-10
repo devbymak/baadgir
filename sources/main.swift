@@ -1568,44 +1568,53 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     }
     /// SF Mono, like other apps' stacked menu bar readings (Stats, for one), so the two sit together evenly.
     private var stackedFont: NSFont { .monospacedSystemFont(ofSize: 10, weight: .medium) }
+    /// A temperature stacked over the fan speed gets a larger font; the four-digit RPM keeps the small one.
+    private var stackedLargeFont: NSFont { .monospacedSystemFont(ofSize: 13, weight: .medium) }
     /// The fan symbol (unless hidden), then readings two to a column: "C 72°" over "G 64°". Not a template image, so the heat colours
     /// show; label colours resolve when the menu bar draws it, so it follows the menu bar's light or dark appearance.
     private func stackedImage(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSImage {
         let font = stackedFont, height = NSStatusBar.system.thickness
-        let lineHeight = ceil(font.ascender - font.descender)
-        func width(_ text: String) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
-        let letterWidth = TemperatureReading.allCases.map { width($0.letter) }.max() ?? 0
-        let gap: CGFloat = 3, spacing: CGFloat = 7
-        // Sized for the widest value so the item never shifts.
-        let column = letterWidth + gap + (model.shownMenuBarReadings.map { width($0.text($0.widest, compact: true)) }.max() ?? 0)
+        func width(_ text: String, _ font: NSFont) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
+        let letterWidth = TemperatureReading.allCases.map { width($0.letter, font) }.max() ?? 0
+        let gap: CGFloat = 3, spacing: CGFloat = 7, lineGap: CGFloat = 3
         let configuration = NSImage.SymbolConfiguration(pointSize: NSFont.systemFontSize, weight: .regular)
             .applying(NSImage.SymbolConfiguration(paletteColors: [.labelColor]))
         let fan = model.showsMenuBarIcon
             ? NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(configuration) : nil
         let fanWidth = fan.map { ceil($0.size.width) + 5 } ?? 0
         let columns = MenuBarLayout.columns(model.shownMenuBarReadings).map { column in
-            column.map { reading -> (letter: String, number: String, color: NSColor) in
+            let withFan = column.contains(.fan)
+            return column.map { reading -> (letter: String, number: String, font: NSFont, widest: CGFloat, color: NSColor) in
                 let level = colored ? model.heatLevel(reading, value(reading)) : nil
-                return (reading.letter, reading.text(value(reading), compact: true), level.map(NSColor.heat) ?? .labelColor)
+                let numberFont = withFan && reading != .fan ? stackedLargeFont : font
+                return (reading.letter, reading.text(value(reading), compact: true), numberFont,
+                        width(reading.text(reading.widest, compact: true), numberFont), level.map(NSColor.heat) ?? .labelColor)
             }
         }
-        let size = NSSize(width: fanWidth + CGFloat(columns.count) * column + CGFloat(max(columns.count - 1, 0)) * spacing,
+        // Sized for the widest values so the item never shifts.
+        let columnWidths = columns.map { lines in letterWidth + gap + (lines.map(\.widest).max() ?? 0) }
+        let size = NSSize(width: fanWidth + columnWidths.reduce(0, +) + CGFloat(max(columns.count - 1, 0)) * spacing,
                           height: height)
         return NSImage(size: size, flipped: true) { _ in
             if let fan {
                 fan.draw(in: NSRect(x: 0, y: (height - fan.size.height) / 2, width: fan.size.width, height: fan.size.height),
                          from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
             }
-            for (index, lines) in columns.enumerated() {
-                let x = fanWidth + CGFloat(index) * (column + spacing)
-                for (line, entry) in lines.enumerated() {
-                    // A column with one reading is centred vertically.
-                    let y = (height - CGFloat(lines.count) * lineHeight) / 2 + CGFloat(line) * lineHeight
+            var x = fanWidth
+            for (lines, columnWidth) in zip(columns, columnWidths) {
+                // Lines are stacked by their digits' cap height, not the font's line height, so the larger font still fits.
+                // A column with one reading is centred vertically.
+                var capTop = (height - lines.map(\.font.capHeight).reduce(0, +) - CGFloat(lines.count - 1) * lineGap) / 2
+                for entry in lines {
+                    let baseline = capTop + entry.font.capHeight
                     NSAttributedString(string: entry.letter, attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
-                        .draw(at: CGPoint(x: x, y: y))
-                    let number = NSAttributedString(string: entry.number, attributes: [.font: font, .foregroundColor: entry.color])
-                    number.draw(at: CGPoint(x: x + column - number.size().width, y: y))  // Right-aligned so digits stay put.
+                        .draw(at: CGPoint(x: x, y: baseline - font.ascender))
+                    let number = NSAttributedString(string: entry.number, attributes: [.font: entry.font, .foregroundColor: entry.color])
+                    // Right-aligned so digits stay put.
+                    number.draw(at: CGPoint(x: x + columnWidth - number.size().width, y: baseline - entry.font.ascender))
+                    capTop = baseline + lineGap
                 }
+                x += columnWidth + spacing
             }
             return true
         }
