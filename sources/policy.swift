@@ -156,7 +156,7 @@ enum TemperatureReading: String, CaseIterable {
     }
     /// The widest value to reserve room for, so the menu bar item never shifts as numbers change.
     var widest: Double { self == .fan ? 9999 : 130 }
-    /// Display bands only; the cooling cutoffs live in `CoolingPolicy`. Fan speed has no colour.
+    /// Display bands only; the cooling cutoffs live in `CoolingPolicy`. Fan speed is banded by `fanLevel`, against the fans' range.
     func level(_ value: Double) -> HeatLevel? {
         let (warm, hot): (Double, Double)
         switch self {
@@ -166,6 +166,12 @@ enum TemperatureReading: String, CaseIterable {
         case .fan: return nil
         }
         return value >= hot ? .hot : value >= warm ? .warm : .normal
+    }
+    /// Fan speed by how far it sits between the fans' minimum and maximum: warm from half way, hot from 80%.
+    static func fanLevel(_ rpm: Double, minimum: Double, maximum: Double) -> HeatLevel? {
+        guard maximum > minimum else { return nil }
+        let position = (rpm - minimum) / (maximum - minimum)
+        return position >= 0.8 ? .hot : position >= 0.5 ? .warm : .normal
     }
 }
 

@@ -595,7 +595,15 @@ final class CoolingModel: ObservableObject {
     }
     /// Colour band for a reading, or nil when colours are off or the value is missing.
     func heatLevel(_ reading: TemperatureReading, _ value: Double?) -> HeatLevel? {
-        guard colorsTemperatures, let value, let level = reading.level(value) else { return nil }
+        guard colorsTemperatures, let value else { return nil }
+        if reading == .fan {
+            // Not a temperature, so macOS thermal pressure doesn't raise it.
+            guard !fans.isEmpty else { return nil }
+            let count = Double(fans.count)
+            return TemperatureReading.fanLevel(value, minimum: fans.map { Double($0.minimum) }.reduce(0, +) / count,
+                                               maximum: fans.map { Double($0.maximum) }.reduce(0, +) / count)
+        }
+        guard let level = reading.level(value) else { return nil }
         return level.raised(by: thermalLevel())
     }
     /// Average speed of all fans, as in the history graph; nil before the first read.
@@ -1111,7 +1119,7 @@ struct SettingsView: View {
                                                         set: { _ in model.toggleMenuBar(reading) }))
                         .disabled(model.shownMenuBarReadings == [reading])  // At least one reading stays on.
                 }
-                Toggle("Color temperatures green, yellow and red", isOn: $model.colorsTemperatures)
+                Toggle("Color temperatures and fan speed by heat", isOn: $model.colorsTemperatures)
                 Toggle("Show the last 10 minutes in the popover", isOn: $model.showsHistory)
             } header: {
                 Text("Menu Bar")
@@ -1403,9 +1411,10 @@ extension Color {
     }
 }
 extension NSColor {
-    static func heat(_ level: HeatLevel) -> NSColor {
+    /// A fan at normal speed keeps the menu bar's own text colour; only temperatures turn green.
+    static func heat(_ level: HeatLevel, _ reading: TemperatureReading) -> NSColor {
         switch level {
-        case .normal: return .systemGreen
+        case .normal: return reading == .fan ? .labelColor : .systemGreen
         case .warm: return .systemYellow
         case .hot: return .systemRed
         }
@@ -1557,7 +1566,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             } else if model.showsMenuBarIcon { text.append(NSAttributedString(string: " ", attributes: base)) }
             var attributes = base
             if colored, let level = model.heatLevel(reading, value(reading)) {
-                attributes[.foregroundColor] = NSColor.heat(level)
+                attributes[.foregroundColor] = NSColor.heat(level, reading)
             }
             text.append(NSAttributedString(string: reading.text(value(reading), compact: readings.count > 1), attributes: attributes))
         }
@@ -1569,7 +1578,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     /// SF Mono, like other apps' stacked menu bar readings (Stats, for one), so the two sit together evenly.
     private var stackedFont: NSFont { .monospacedSystemFont(ofSize: 10, weight: .medium) }
     /// A temperature stacked over the fan speed gets a larger font; the four-digit RPM keeps the small one.
-    private var stackedLargeFont: NSFont { .monospacedSystemFont(ofSize: 13, weight: .medium) }
+    private var stackedLargeFont: NSFont { .monospacedSystemFont(ofSize: 11.5, weight: .medium) }
     /// The fan symbol (unless hidden), then readings two to a column: "C 72°" over "G 64°". Not a template image, so the heat colours
     /// show; label colours resolve when the menu bar draws it, so it follows the menu bar's light or dark appearance.
     private func stackedImage(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSImage {
@@ -1588,7 +1597,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
                 let level = colored ? model.heatLevel(reading, value(reading)) : nil
                 let numberFont = withFan && reading != .fan ? stackedLargeFont : font
                 return (reading.letter, reading.text(value(reading), compact: true), numberFont,
-                        width(reading.text(reading.widest, compact: true), numberFont), level.map(NSColor.heat) ?? .labelColor)
+                        width(reading.text(reading.widest, compact: true), numberFont), level.map { NSColor.heat($0, reading) } ?? .labelColor)
             }
         }
         // Sized for the widest values so the item never shifts.

@@ -215,7 +215,11 @@ check(TemperatureReading.fan.text(2496.4, compact: false) == "2496 RPM" && Tempe
       "Menu bar text uses RPM for the fan and °C for temperatures")
 check(TemperatureReading.fan.level(6000) == nil && TemperatureReading.fan.value(in: normal) == nil &&
       TemperatureReading.fan.text(TemperatureReading.fan.widest, compact: true).count >= 4,
-      "Fan speed has no heat colour, isn't a temperature, and reserves four digits")
+      "Fan speed has no temperature colour, isn't a temperature, and reserves four digits")
+check(TemperatureReading.fanLevel(2400, minimum: 1000, maximum: 4000) == .normal &&
+      TemperatureReading.fanLevel(2500, minimum: 1000, maximum: 4000) == .warm &&
+      TemperatureReading.fanLevel(3400, minimum: 1000, maximum: 4000) == .hot &&
+      TemperatureReading.fanLevel(2000, minimum: 0, maximum: 0) == nil, "Fan speed colour bands follow the fans' range")
 let userFile = NSTemporaryDirectory() + "baadgir-test-" + UUID().uuidString
 FileManager.default.createFile(atPath: userFile, contents: Data())
 check(isRootOwned("/bin/sh") && !isRootOwned(userFile) && !isRootOwned("/bin") && !isRootOwned("bin/sh") &&
