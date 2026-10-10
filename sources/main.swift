@@ -1352,7 +1352,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private func updateTitle() {
         item.button?.attributedTitle = title(currentValue, colored: true)
     }
-    private var stackedFont: NSFont { .monospacedDigitSystemFont(ofSize: 10, weight: .medium) }
+    /// SF Mono, like other apps' stacked menu bar readings (Stats, for one), so the two sit together evenly.
+    private var stackedFont: NSFont { .monospacedSystemFont(ofSize: 10, weight: .medium) }
     /// The fan symbol (unless hidden), then readings two to a column: "C 72°" over "G 64°". Not a template image, so the heat colours
     /// show; label colours resolve when the menu bar draws it, so it follows the menu bar's light or dark appearance.
     private func stackedImage(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSImage {
