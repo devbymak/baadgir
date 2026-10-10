@@ -21,8 +21,8 @@ cat > 'Parvanak.app/Contents/Info.plist' <<'PLIST'
 <key>CFBundleDisplayName</key><string>Parvanak</string>
 <key>CFBundleIconFile</key><string>app-icon.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>2</string>
-<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.3.0</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 </dict></plist>

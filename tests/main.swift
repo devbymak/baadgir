@@ -52,7 +52,23 @@ rejects("Battery temperature cutoff") { try CoolingPolicy.validateTemperature(ho
 for level in [ThermalLevel.serious, .critical, .unknown] {
     rejects("High or unknown thermal pressure") { try CoolingPolicy.validateTemperature(normal, thermal: level, starting: false) }
 }
-check(CoolingPolicy.sessionSeconds == 60, "Manual control must remain time-limited")
+check(CoolingPolicy.heartbeatTimeout <= 10, "Helper must give up quickly when the app stops responding")
+var heartbeat = Heartbeat()
+check(heartbeat.isFresh(stamp: 100, now: 0), "First heartbeat is fresh")
+check(heartbeat.isFresh(stamp: 100, now: CoolingPolicy.heartbeatTimeout), "Unchanged heartbeat within timeout")
+check(!heartbeat.isFresh(stamp: 100, now: CoolingPolicy.heartbeatTimeout + 0.1), "Unchanged heartbeat goes stale")
+check(heartbeat.isFresh(stamp: 50, now: 11), "Any new stamp counts, even if the wall clock moved backwards")
+check(!heartbeat.isFresh(stamp: 50, now: 30), "Stale again after the app stops updating")
+try CoolingPolicy.validateLimits(minimum: 1500, maximum: 5500, hardware: hardware)
+checks += 1
+rejects("Limits outside hardware") { try CoolingPolicy.validateLimits(minimum: 1000, maximum: 5500, hardware: hardware) }
+for target in [CoolingTarget.manual(rpm: 3200), .maximum] {
+    try check(try CoolingTarget(encoded: target.encoded) == target, "Cooling target round trip")
+}
+try check(try CoolingTarget(encoded: "manual 2999.6") == .manual(rpm: 2999.6), "Manual target parsing")
+for text in ["", "manual", "manual fast", "manual nan", "manual inf", "maximum 1", "auto", "manual 1 2"] {
+    rejects("Malformed cooling target \(text)") { _ = try CoolingTarget(encoded: text) }
+}
 try check(try SMCValue.decode(type: "sp78", bytes: [0x18, 0x80]) == 24.5, "Temperature fixed-point decoding")
 try check(try SMCValue.decode(type: "fpe2", bytes: [0x17, 0x70]) == 1500, "Fan fixed-point decoding")
 try check(try SMCValue.decode(type: "ui8 ", bytes: [3]) == 3, "Fan mode decoding")
@@ -88,4 +104,18 @@ check(!failed && secondFanMode == 0, "Restore other fans even if one cannot be v
 let rejected = AutomaticRestoration.restore(keys: ["F0md"], readMode: { _ in 1 },
     writeAutomatic: { _ in throw Failure("Write rejected") }, retryDelay: {})
 check(!rejected, "Report failure when automatic control cannot be restored")
+check(TemperatureReading.cpu.level(69) == .normal && TemperatureReading.cpu.level(70) == .warm &&
+      TemperatureReading.cpu.level(85) == .hot, "CPU colour bands")
+check(TemperatureReading.battery.level(34) == .normal && TemperatureReading.battery.level(35) == .warm &&
+      TemperatureReading.battery.level(40) == .hot, "Battery colour bands")
+check(HeatLevel.normal.raised(by: .fair) == .warm && HeatLevel.hot.raised(by: .fair) == .hot &&
+      HeatLevel.normal.raised(by: .serious) == .hot && HeatLevel.warm.raised(by: .nominal) == .warm,
+      "Thermal pressure only raises the colour")
+check(TemperatureReading.ssd.level(54) == .normal && TemperatureReading.ssd.level(55) == .warm &&
+      TemperatureReading.ssd.level(70) == .hot, "SSD colour bands")
+let withSSD = try Temperatures(cpu: [50], gpu: [50], ssd: [41, 48])
+check(TemperatureReading.ssd.value(in: withSSD) == 48 && withSSD.highest == 50, "SSD is shown but not part of CPU/GPU hottest")
+rejects("Invalid SSD sensor") { _ = try Temperatures(cpu: [50], gpu: [50], ssd: [.nan]) }
+check(TemperatureReading.hottest.value(in: normal) == 60 && TemperatureReading.battery.value(in: warm) == nil,
+      "Menu bar reading selection")
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")

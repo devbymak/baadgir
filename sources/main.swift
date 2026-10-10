@@ -58,6 +58,7 @@ final class SMC {
     private var cpuKeys: [String] = []
     private var gpuKeys: [String] = []
     private var batteryKeys: [String] = []
+    private var ssdKeys: [String] = []
     private var discoveredTemperatures = false
     func temperatures() throws -> Temperatures {
         if !discoveredTemperatures {
@@ -79,6 +80,8 @@ final class SMC {
             cpuKeys = available(cpuCandidates)
             gpuKeys = available(gpuCandidates)
             batteryKeys = available(["TB0T", "TB1T", "TB2T"])
+            // SSD (NAND) sensors; display only.
+            ssdKeys = available(["TH0x", "TH0A", "TH0B", "TH0a", "TH0b"])
             guard !cpuKeys.isEmpty, !gpuKeys.isEmpty else {
                 throw Failure("CPU and GPU temperature readings are unavailable")
             }
@@ -87,7 +90,8 @@ final class SMC {
         // Once discovered, every sensor must stay readable. Never silently discard a failed sensor.
         return try Temperatures(cpu: cpuKeys.map { Double(try number($0)) },
                                 gpu: gpuKeys.map { Double(try number($0)) },
-                                battery: batteryKeys.map { Double(try number($0)) })
+                                battery: batteryKeys.map { Double(try number($0)) },
+                                ssd: ssdKeys.map { Double(try number($0)) })
     }
     func fans() throws -> [Fan] {
         let count = try number("FNum")
@@ -129,11 +133,6 @@ final class SMC {
     }
 }
 
-struct ManualRequest {
-    let rpm: Double
-    let minimum: Double
-    let maximum: Double
-}
 func thermalLevel() -> ThermalLevel {
     switch ProcessInfo.processInfo.thermalState {
     case .nominal: return .nominal
@@ -145,15 +144,38 @@ func thermalLevel() -> ThermalLevel {
 }
 var interrupted: sig_atomic_t = 0
 func handleSignal(_ signal: Int32) { interrupted = 1 }
-func coolingSession(parent: pid_t, stopPath: String, manual: ManualRequest? = nil) throws {
-    guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
+func acquireLock() throws -> Int32 {
     let lock = open("/var/run/local.parvanak.lock", O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     guard lock >= 0 else { throw Failure("Cannot create cooling session lock") }
-    defer { close(lock) }
-    guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw Failure("A cooling session is already running") }
-    guard kill(parent, 0) == 0, !FileManager.default.fileExists(atPath: stopPath) else {
-        throw Failure("Cooling session was cancelled before it started")
+    guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
+        close(lock)
+        throw Failure(lockBusy)
     }
+    return lock
+}
+/// Reads the app's requested target and the control file's modification time.
+func readControl(_ path: String) throws -> (target: CoolingTarget, modified: Double) {
+    // Non-blocking so a FIFO in place of the file cannot stall the helper while fans are manual.
+    let file = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+    guard file >= 0 else { throw Failure("Cooling controls are unavailable; returning to automatic cooling") }
+    defer { close(file) }
+    var info = stat()
+    guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 64 else {
+        throw Failure("Cooling controls are invalid")
+    }
+    var buffer = [UInt8](repeating: 0, count: 64)
+    let count = read(file, &buffer, buffer.count)
+    guard count > 0 else { throw Failure("Cooling controls are empty") }
+    let modified = Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9
+    return (try CoolingTarget(encoded: String(decoding: buffer[0..<count], as: UTF8.self)), modified)
+}
+func coolingSession(parent: pid_t, directory: String) throws {
+    guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
+    let lock = try acquireLock()
+    defer { close(lock) }
+    let stopPath = directory + "/stop", controlPath = directory + "/control"
+    func cancelled() -> Bool { kill(parent, 0) != 0 || FileManager.default.fileExists(atPath: stopPath) }
+    guard !cancelled() else { throw Failure("Cooling session was cancelled before it started") }
     let smc = try SMC()
     let fans = try smc.fans()
     guard fans.allSatisfy({ $0.rpm <= $0.maximum }) else {
@@ -162,13 +184,33 @@ func coolingSession(parent: pid_t, stopPath: String, manual: ManualRequest? = ni
     guard fans.allSatisfy({ $0.mode != 1 }) else {
         throw Failure("Another app already controls a fan. Return it to Auto first.")
     }
-    if let manual {
-        let bounds = try HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
-        try CoolingPolicy.validateRange(rpm: manual.rpm, minimum: manual.minimum,
-                                        maximum: manual.maximum, hardware: bounds)
+    let bounds = try HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
+    var heartbeat = Heartbeat()
+    func requestedTarget() throws -> CoolingTarget {
+        let (target, modified) = try readControl(controlPath)
+        guard heartbeat.isFresh(stamp: modified, now: ProcessInfo.processInfo.systemUptime) else {
+            throw Failure("Parvanak stopped responding; returning to automatic cooling")
+        }
+        if case .manual(let rpm) = target {
+            try CoolingPolicy.validateRange(rpm: rpm, minimum: bounds.minimum, maximum: bounds.maximum, hardware: bounds)
+        }
+        return target
+    }
+    func rpm(for fan: Fan, _ target: CoolingTarget) -> Float {
+        if case .manual(let rpm) = target { return Float(rpm) }
+        return fan.maximum
+    }
+    // The first target must also be recent by wall clock; later checks use the monotonic heartbeat.
+    guard abs(Date().timeIntervalSince1970 - (try readControl(controlPath)).modified) <= CoolingPolicy.heartbeatTimeout else {
+        throw Failure("Cooling controls are stale")
+    }
+    if case .manual = try requestedTarget() {
         try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: true)
     }
     signal(SIGTERM, handleSignal); signal(SIGINT, handleSignal); signal(SIGHUP, handleSignal)
+    // Started before any fan is touched; it restores Auto even if this process is force-killed.
+    let watchdog = try startWatchdog(executable: Bundle.main.executablePath ?? CommandLine.arguments[0])
+    defer { close(watchdog) }
     var touched: [Fan] = []
     func restore() -> Bool {
         AutomaticRestoration.restore(keys: touched.map(\.modeKey),
@@ -177,9 +219,7 @@ func coolingSession(parent: pid_t, stopPath: String, manual: ManualRequest? = ni
             retryDelay: { usleep(100_000) })
     }
     do {
-        guard kill(parent, 0) == 0, !FileManager.default.fileExists(atPath: stopPath) else {
-            throw Failure("Cooling session was cancelled")
-        }
+        guard !cancelled() else { throw Failure("Cooling session was cancelled") }
         for fan in fans {
             // Start at maximum to avoid entering manual mode with a stale low target.
             touched.append(fan)
@@ -190,31 +230,32 @@ func coolingSession(parent: pid_t, stopPath: String, manual: ManualRequest? = ni
                 throw Failure("Fan controller did not confirm maximum cooling")
             }
         }
-        if let manual {
-            try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: true)
-            for fan in fans { try smc.target(fan, rpm: Float(manual.rpm)) }
-        }
+        var applied = CoolingTarget.maximum
         let clock = ContinuousClock()
-        let start = clock.now
-        let deadline = start.advanced(by: .seconds(CoolingPolicy.sessionSeconds))
-        var previous = start
-        while clock.now < deadline && interrupted == 0 {
+        var previous = clock.now
+        var changed = previous
+        // Runs until the app chooses Auto, quits, stops responding, or a safety check fails.
+        while interrupted == 0 {
             let now = clock.now
-            if previous.duration(to: now) > .seconds(3) || kill(parent, 0) != 0 ||
-                FileManager.default.fileExists(atPath: stopPath) { break }
+            if previous.duration(to: now) > .seconds(3) || cancelled() { break }
             previous = now
-            if manual != nil {
+            let target = try requestedTarget()
+            if case .manual = target {
                 try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(), starting: false)
+            }
+            if target != applied {
+                for fan in fans { try smc.target(fan, rpm: rpm(for: fan, target)) }
+                applied = target; changed = now
             }
             let live = try smc.fans()
             guard live.count == fans.count else { throw Failure("Fan configuration changed") }
             for (fan, original) in zip(live, fans) {
-                let target = Float(manual?.rpm ?? Double(original.maximum))
+                let expected = rpm(for: original, applied)
                 guard fan.minimum == original.minimum, fan.maximum == original.maximum,
-                      fan.mode == 1, abs(try smc.number("F\(fan.index)Tg") - target) <= 1 else {
+                      fan.mode == 1, abs(try smc.number("F\(fan.index)Tg") - expected) <= 1 else {
                     throw Failure("System reclaimed fan control; session ended")
                 }
-                if start.duration(to: now) > .seconds(5), fan.rpm < max(300, target * 0.35) {
+                if changed.duration(to: now) > .seconds(5), fan.rpm < max(300, expected * 0.35) {
                     throw Failure("Fan speed did not respond; returning to automatic cooling")
                 }
             }
@@ -228,44 +269,139 @@ func coolingSession(parent: pid_t, stopPath: String, manual: ManualRequest? = ni
     }
     guard restore() else { throw Failure("Automatic control could not be verified. Restart your Mac.") }
 }
+/// Spawns `executable --watchdog` with the read end of a pipe as stdin and returns the write end.
+/// The watchdog sees end-of-file when this process exits for any reason, including SIGKILL.
+func startWatchdog(executable: String) throws -> Int32 {
+    var fds: [Int32] = [0, 0]
+    guard pipe(&fds) == 0 else { throw Failure("Cannot start the safety watchdog") }
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    posix_spawn_file_actions_adddup2(&actions, fds[0], STDIN_FILENO)
+    // Detached output: no log files, and the administrator prompt's pipe isn't held open.
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+    var attributes: posix_spawnattr_t?
+    posix_spawnattr_init(&attributes)
+    defer { posix_spawnattr_destroy(&attributes) }
+    // Inherit nothing else (notably the session lock) and leave this process group's signals behind.
+    posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP))
+    posix_spawnattr_setpgroup(&attributes, 0)
+    let argv = [executable, "--watchdog"].map { strdup($0) } + [nil]
+    defer { argv.forEach { free($0) } }
+    var pid: pid_t = 0
+    let result = posix_spawn(&pid, executable, &actions, &attributes, argv, environ)
+    close(fds[0])
+    guard result == 0 else { close(fds[1]); throw Failure("Cannot start the safety watchdog") }
+    return fds[1]
+}
+/// Waits for the helper to exit, then makes sure no fan is left in manual mode.
+func watchdog() {
+    signal(SIGHUP, SIG_IGN); signal(SIGINT, SIG_IGN)
+    var byte: UInt8 = 0
+    while true {
+        let count = read(STDIN_FILENO, &byte, 1)
+        if count == 0 || (count < 0 && errno != EINTR) { break }
+    }
+    // The helper's lock may close a moment after the pipe.
+    for _ in 0..<20 {
+        do { try restoreAutomatic(); return }
+        catch let failure as Failure where failure.description == lockBusy { usleep(100_000) }
+        catch { return }
+    }
+}
+let lockBusy = "A cooling session is already running"
+/// Returns fans left in manual mode (for example after a crash or by another app) to Auto.
+func restoreAutomatic() throws {
+    guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
+    let lock = try acquireLock()
+    defer { close(lock) }
+    let smc = try SMC()
+    let manual = try smc.fans().filter { $0.mode == 1 }
+    guard AutomaticRestoration.restore(keys: manual.map(\.modeKey),
+        readMode: { Double(try smc.number($0)) },
+        writeAutomatic: { try smc.write($0, expectedType: "ui8 ", bytes: [0]) },
+        retryDelay: { usleep(100_000) }) else {
+        throw Failure("Automatic control could not be verified. Restart your Mac.")
+    }
+}
+
+enum FanMode: Hashable { case auto, manual, maximum }
 
 final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
     @Published var temperatures: Temperatures?
     @Published var sensorError = "Reading sensors…"
-    @Published var status = "Automatic cooling"
-    @Published var minimumText = "1000" { didSet { clampSelection() } }
-    @Published var maximumText = "6000" { didSet { clampSelection() } }
-    @Published var selectedRPM = 6000.0
-    @Published var sessionRunning = false
-    @Published var remainingSeconds: Int?
+    @Published var minimumText = "1000" { didSet { limitsChanged() } }
+    @Published var maximumText = "6000" { didSet { limitsChanged() } }
+    @Published var selectedRPM = 6000.0 {
+        didSet { if initializedLimits { defaults.set(Int(selectedRPM.rounded()), forKey: "manualRPM") } }
+    }
+    @Published private(set) var mode = FanMode.auto
+    @Published private(set) var sessionRunning = false
+    @Published private(set) var pending: String?
     @Published var message: String?
+    /// Readings shown in the menu bar, in menu order. Never empty.
+    @Published var menuBarReadings: [TemperatureReading] = {
+        let saved = (UserDefaults.standard.stringArray(forKey: "menuBarReadings") ?? [])
+            .compactMap(TemperatureReading.init(rawValue:))
+        return saved.isEmpty ? [.hottest] : saved
+    }() {
+        didSet { defaults.set(menuBarReadings.map(\.rawValue), forKey: "menuBarReadings"); onMenuBarLayoutChange?() }
+    }
+    var onMenuBarLayoutChange: (() -> Void)?
+    func toggleMenuBar(_ reading: TemperatureReading) {
+        if menuBarReadings.contains(reading) {
+            guard menuBarReadings.count > 1 else { return }
+            menuBarReadings.removeAll { $0 == reading }
+        } else {
+            menuBarReadings = TemperatureReading.allCases.filter { $0 == reading || menuBarReadings.contains($0) }
+        }
+    }
+    @Published var colorsTemperatures = UserDefaults.standard.object(forKey: "colorsTemperatures") as? Bool ?? true {
+        didSet { defaults.set(colorsTemperatures, forKey: "colorsTemperatures"); onUpdate?() }
+    }
+    /// Colour band for a reading, or nil when colours are off or the value is missing.
+    func heatLevel(_ reading: TemperatureReading, _ value: Double?) -> HeatLevel? {
+        guard colorsTemperatures, let value else { return nil }
+        return reading.level(value).raised(by: thermalLevel())
+    }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
     private let queue = DispatchQueue(label: "local.parvanak.sensors")
+    private let defaults = UserDefaults.standard
     private var smc: SMC?
     private var reading = false
     private var initializedLimits = false
     private var helper: Process?
-    private var stopPath: String?
-    private var observedStart: Date?
+    private var directory: URL?
 
     var minimum: Double? { Double(minimumText) }
     var maximum: Double? { Double(maximumText) }
     var rangeIsValid: Bool {
         guard let bounds, let minimum, let maximum else { return false }
-        return (try? CoolingPolicy.validateRange(rpm: selectedRPM, minimum: minimum,
-                                                 maximum: maximum, hardware: bounds)) != nil
+        return (try? CoolingPolicy.validateLimits(minimum: minimum, maximum: maximum, hardware: bounds)) != nil
     }
     var sliderRange: ClosedRange<Double> {
-        if let bounds, let minimum, let maximum,
-           minimum.isFinite, maximum.isFinite, minimum >= bounds.minimum,
-           maximum <= bounds.maximum, minimum < maximum { return minimum...maximum }
+        if rangeIsValid, let minimum, let maximum { return minimum...maximum }
         return (bounds?.minimum ?? 1000)...(bounds?.maximum ?? 6000)
     }
-    var canApply: Bool {
-        rangeIsValid && !sessionRunning && fans.allSatisfy({ $0.mode != 1 }) &&
-        (try? CoolingPolicy.validateTemperature(temperatures, thermal: thermalLevel(), starting: true)) != nil
+    /// Fans held in manual mode by something other than this app's session.
+    var externallyControlled: Bool {
+        !sessionRunning && Date() > settlingUntil && fans.contains(where: { $0.mode == 1 })
+    }
+    private var settlingUntil = Date.distantPast
+    var showsManualControls: Bool { sessionRunning && mode == .manual }
+    var displayedMode: FanMode {
+        if sessionRunning { return mode }
+        return externallyControlled ? .manual : .auto
+    }
+    var status: String {
+        if let pending { return pending }
+        if externallyControlled { return "A fan is stuck in manual mode" }
+        guard sessionRunning else { return "Automatic cooling" }
+        if mode == .maximum { return "Maximum cooling" }
+        return "Manual · \(Int(selectedRPM.rounded()).formatted()) RPM"
     }
     var thermalText: String {
         switch thermalLevel() {
@@ -276,11 +412,30 @@ final class CoolingModel: ObservableObject {
         case .unknown: return "Unknown"
         }
     }
-    func clampSelection() {
+    private func limitsChanged() {
+        if initializedLimits, rangeIsValid, let minimum, let maximum {
+            defaults.set(Int(minimum), forKey: "minimumRPM")
+            defaults.set(Int(maximum), forKey: "maximumRPM")
+        }
         guard selectedRPM.isFinite else { selectedRPM = sliderRange.upperBound; return }
         selectedRPM = min(max(selectedRPM, sliderRange.lowerBound), sliderRange.upperBound)
     }
+    private func loadLimits(_ bounds: HardwareBounds) {
+        let lower = Int(ceil(bounds.minimum)), upper = Int(floor(bounds.maximum))
+        let savedMinimum = defaults.object(forKey: "minimumRPM") as? Int
+        let savedMaximum = defaults.object(forKey: "maximumRPM") as? Int
+        if let savedMinimum, let savedMaximum, (try? CoolingPolicy.validateLimits(
+            minimum: Double(savedMinimum), maximum: Double(savedMaximum), hardware: bounds)) != nil {
+            minimumText = String(savedMinimum); maximumText = String(savedMaximum)
+        } else {
+            minimumText = String(lower); maximumText = String(upper)
+        }
+        selectedRPM = Double(defaults.object(forKey: "manualRPM") as? Int ?? upper)
+        limitsChanged()
+        initializedLimits = true
+    }
     func refresh() {
+        heartbeat()
         guard !reading else { return }
         reading = true
         queue.async { [weak self] in
@@ -301,49 +456,98 @@ final class CoolingModel: ObservableObject {
                 self.reading = false
                 self.fans = fans; self.temperatures = temperatures; self.sensorError = errorMessage
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
-                if !self.initializedLimits, let bounds = self.bounds {
-                    self.minimumText = String(Int(ceil(bounds.minimum)))
-                    self.maximumText = String(Int(floor(bounds.maximum)))
-                    self.selectedRPM = floor(bounds.maximum)
-                    self.initializedLimits = true
-                }
-                if self.sessionRunning && fans.contains(where: { $0.mode == 1 }) {
-                    if self.observedStart == nil { self.observedStart = Date() }
-                    self.remainingSeconds = max(0, CoolingPolicy.sessionSeconds - Int(Date().timeIntervalSince(self.observedStart!)))
-                    self.status = "Manual cooling · \(self.remainingSeconds!)s remaining"
-                }
+                if !self.initializedLimits, let bounds = self.bounds { self.loadLimits(bounds) }
+                if self.sessionRunning, self.pending != nil, self.stopRequested == false,
+                   fans.contains(where: { $0.mode == 1 }) { self.pending = nil }
                 // The helper performs its own independent sensor checks as well.
-                if self.sessionRunning && !errorMessage.isEmpty && temperatures == nil {
-                    // A maximum-only boost can run without temperatures; its RPM is never reduced.
-                    if self.manualSession { self.endSession() }
-                }
+                // Maximum cooling can run without temperatures; its RPM is never reduced.
+                if self.sessionRunning && self.mode == .manual && temperatures == nil { self.endSession() }
                 self.onUpdate?()
             }
         }
     }
-    private var manualSession = false
-    private func shellQuote(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+
+    // MARK: Mode changes
+
+    func select(_ newMode: FanMode) {
+        message = nil
+        switch newMode {
+        case .auto:
+            if sessionRunning { endSession() }
+            else if externallyControlled { restoreAutomaticControl() }
+        case .manual:
+            if let reason = manualBlocker() { message = reason; break }
+            if sessionRunning { mode = .manual; heartbeat() }
+            else if externallyControlled { message = "Choose Auto to release the fans first." }
+            else { startSession(.manual) }
+        case .maximum:
+            if sessionRunning { mode = .maximum; heartbeat() }
+            else if externallyControlled { message = "Choose Auto to release the fans first." }
+            else if fans.isEmpty { message = "No controllable fans were found." }
+            else { startSession(.maximum) }
+        }
+        onUpdate?()
     }
-    func applyManual() {
-        guard canApply, let minimum, let maximum else { return }
-        startSession(manual: ManualRequest(rpm: selectedRPM.rounded(), minimum: minimum, maximum: maximum))
+    private func manualBlocker() -> String? {
+        guard let bounds, let minimum, let maximum else { return "Fan limits are unavailable." }
+        do {
+            try CoolingPolicy.validateRange(rpm: selectedRPM.rounded(), minimum: minimum,
+                                            maximum: maximum, hardware: bounds)
+            // Already in manual: the helper enforces the running cutoff.
+            if !(sessionRunning && mode == .manual) {
+                try CoolingPolicy.validateTemperature(temperatures, thermal: thermalLevel(), starting: true)
+            }
+        } catch { return String(describing: error) }
+        return nil
     }
-    func maximumBoost() {
-        guard !sessionRunning, !fans.isEmpty, fans.allSatisfy({ $0.mode != 1 }) else { return }
-        startSession(manual: nil)
+    /// Writes the current target. Rewritten every second so the helper knows the app is alive.
+    func heartbeat() {
+        guard sessionRunning, !stopRequested, let directory else { return }
+        let target = mode == .maximum ? CoolingTarget.maximum : .manual(rpm: selectedRPM.rounded())
+        do { try target.encoded.write(to: directory.appendingPathComponent("control"), atomically: true, encoding: .utf8) }
+        catch { message = "Cannot update fan speed: \(error.localizedDescription)" }
     }
-    private func startSession(manual: ManualRequest?) {
+    private var stopRequested = false
+    private func startSession(_ newMode: FanMode) {
         guard helper == nil else { return }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("parvanak-" + UUID().uuidString)
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         catch { message = "Cannot create cooling session: \(error)"; return }
-        let stopFile = directory.appendingPathComponent("stop").path
-        stopPath = stopFile
+        self.directory = directory
+        mode = newMode; sessionRunning = true; stopRequested = false
+        heartbeat()
+        let started = runPrivileged(["--control", String(getpid()), directory.path]) { [weak self] success in
+            guard let self else { return }
+            self.directory = nil; self.sessionRunning = false
+            self.mode = .auto; self.pending = nil; self.stopRequested = false
+            try? FileManager.default.removeItem(at: directory)
+            if success { self.message = nil }
+        }
+        if started { pending = "Waiting for administrator authorization…" }
+        else {
+            sessionRunning = false; mode = .auto; self.directory = nil
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+    func endSession() {
+        guard sessionRunning, let directory else { return }
+        stopRequested = true
+        if !FileManager.default.createFile(atPath: directory.appendingPathComponent("stop").path, contents: Data()) {
+            // Without fresh heartbeats the helper still restores Auto within seconds.
+            message = "Could not signal stop. Automatic cooling returns within \(Int(CoolingPolicy.heartbeatTimeout)) seconds."
+        }
+        pending = "Restoring automatic cooling…"; onUpdate?()
+    }
+    private func restoreAutomaticControl() {
+        guard helper == nil else { return }
+        if runPrivileged(["--restore"], completion: { [weak self] _ in self?.pending = nil }) {
+            pending = "Restoring automatic cooling…"
+        }
+    }
+    /// Runs this executable as root through an administrator prompt. Returns false if it could not launch.
+    private func runPrivileged(_ arguments: [String], completion: @escaping (Bool) -> Void) -> Bool {
         let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        var args = [executable, manual == nil ? "--boost" : "--control", String(getpid()), stopFile]
-        if let manual { args += [String(manual.rpm), String(manual.minimum), String(manual.maximum)] }
-        let command = args.map(shellQuote).joined(separator: " ")
+        let command = ([executable] + arguments).map(shellQuote).joined(separator: " ")
         let literal = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -353,145 +557,343 @@ final class CoolingModel: ObservableObject {
             let error = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.helper = nil; self.stopPath = nil; self.sessionRunning = false
-                self.observedStart = nil; self.remainingSeconds = nil
-                self.status = completed.terminationStatus == 0 ? "Automatic cooling restored" : "Cooling session ended"
-                try? FileManager.default.removeItem(at: directory)
-                if completed.terminationStatus != 0 { self.message = error.isEmpty ? "Cooling session could not complete" : error }
+                let success = completed.terminationStatus == 0
+                self.helper = nil
+                // The last sensor read may predate restoration; don't report a stuck fan from it.
+                self.settlingUntil = Date().addingTimeInterval(2)
+                completion(success)
+                if !success { self.message = Self.readableError(error) }
                 self.refresh(); self.onUpdate?()
             }
         }
-        helper = process; manualSession = manual != nil
-        status = "Waiting for administrator authorization…"
-        sessionRunning = true; message = nil
         do { try process.run() }
-        catch {
-            helper = nil; stopPath = nil; sessionRunning = false
-            status = "Automatic cooling"; message = String(describing: error)
-            try? FileManager.default.removeItem(at: directory)
-        }
-        onUpdate?()
+        catch { message = String(describing: error); return false }
+        helper = process
+        return true
     }
-    func endSession() {
-        guard let path = stopPath else { return }
-        if !FileManager.default.createFile(atPath: path, contents: Data()) {
-            message = "Could not signal stop. The helper should finish at its 60-second deadline."
-        }
-        status = "Restoring automatic cooling…"; onUpdate?()
+    private func shellQuote(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+    private static func readableError(_ text: String) -> String {
+        if text.contains("(-128)") { return "Administrator authorization was cancelled." }
+        var text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let range = text.range(of: "execution error: ") { text = String(text[range.upperBound...]) }
+        if let range = text.range(of: #" \(-?\d+\)$"#, options: .regularExpression) { text.removeSubrange(range) }
+        return text.isEmpty ? "Cooling session could not complete." : text
     }
 }
 
 struct ControlsView: View {
     @ObservedObject var model: CoolingModel
     let quit: () -> Void
+    var openSettings: () -> Void = {}
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 10) {
-                    if let icon = NSImage(named: "app-icon") {
-                        Image(nsImage: icon).resizable().frame(width: 36, height: 36).accessibilityHidden(true)
-                    } else { Image(systemName: "fan").font(.title2).accessibilityHidden(true) }
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Parvanak").font(.headline)
-                        Text(model.status).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                if let icon = NSImage(named: "app-icon") {
+                    Image(nsImage: icon).resizable().frame(width: 36, height: 36).accessibilityHidden(true)
+                } else { Image(systemName: "fan").font(.title2).accessibilityHidden(true) }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Parvanak").font(.headline)
+                    Text(model.status).font(.caption).foregroundStyle(.secondary)
                 }
-                HStack(spacing: 24) {
-                    temperature("CPU", value: model.temperatures?.cpu)
-                    temperature("GPU", value: model.temperatures?.gpu)
-                    Spacer()
-                }
-                Text("Thermal pressure: \(model.thermalText)").font(.caption).foregroundStyle(.secondary)
-                ForEach(model.fans, id: \.index) { fan in
-                    HStack {
-                        Text("Fan \(fan.index + 1)")
-                        Spacer()
-                        Text("\(Int(fan.rpm)) RPM").monospacedDigit()
-                        Text(fan.mode == 1 ? "Manual" : "Auto").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                if !model.sensorError.isEmpty {
-                    Text(model.sensorError).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                }
-                Divider()
+                Spacer()
+            }
+            HStack(alignment: .top, spacing: 12) {
+                temperature(.cpu, value: model.temperatures?.cpu)
+                temperature(.gpu, value: model.temperatures?.gpu)
+                if let battery = model.temperatures?.battery { temperature(.battery, value: battery) }
+                if let ssd = model.temperatures?.ssd { temperature(.ssd, value: ssd) }
+            }
+            HStack(spacing: 0) {
+                Text("Thermal pressure: ").foregroundStyle(.secondary)
+                Text(model.thermalText).foregroundStyle(thermalColor)
+            }
+            .font(.caption)
+            ForEach(model.fans, id: \.index) { fan in
                 HStack {
-                    Text("Fan speed").font(.headline)
+                    Text("Fan \(fan.index + 1)")
                     Spacer()
-                    Text("\(Int(model.selectedRPM.rounded())) RPM").monospacedDigit()
+                    Text("\(Int(fan.rpm)) RPM").monospacedDigit()
+                    Text(fan.mode == 1 ? "Manual" : "Auto").font(.caption).foregroundStyle(.secondary)
+                        .frame(width: 44, alignment: .trailing)
                 }
-                Slider(value: $model.selectedRPM, in: model.sliderRange, step: 1)
-                    .disabled(model.bounds == nil || model.sessionRunning)
-                    .accessibilityLabel("Fan speed in RPM")
-                HStack(spacing: 16) {
-                    limitField("Minimum RPM", text: $model.minimumText)
-                    limitField("Maximum RPM", text: $model.maximumText)
+            }
+            if !model.sensorError.isEmpty {
+                Text(model.sensorError).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            Divider()
+            Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.select($0) })) {
+                Text("Auto").tag(FanMode.auto)
+                Text("Manual").tag(FanMode.manual)
+                Text("Max").tag(FanMode.maximum)
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            .disabled(model.pending != nil || model.fans.isEmpty)
+            if model.showsManualControls { manualControls }
+            Text(explanation).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let message = model.message {
+                Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            HStack {
+                Button("Settings…", action: openSettings).buttonStyle(.plain).foregroundStyle(.secondary)
+                Spacer()
+                Button("Quit Parvanak", action: quit).buttonStyle(.plain).foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .frame(width: 340)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    @ViewBuilder private var manualControls: some View {
+        HStack {
+            Text("Manual speed").font(.headline)
+            Spacer()
+            Text("\(Int(model.selectedRPM.rounded())) RPM").monospacedDigit()
+        }
+        // No `step:` here: on macOS it draws one tick mark per step.
+        Slider(value: $model.selectedRPM, in: model.sliderRange) { editing in
+            if !editing { model.heartbeat() }
+        }
+        .disabled(model.bounds == nil || !model.rangeIsValid)
+        .accessibilityLabel("Manual fan speed in RPM")
+        if model.bounds != nil && !model.rangeIsValid {
+            Text("Fix the speed limits in Settings.").font(.caption).foregroundStyle(.orange)
+        } else {
+            Text("Range \(Int(model.sliderRange.lowerBound).formatted())–\(Int(model.sliderRange.upperBound).formatted()) RPM · change limits in Settings")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+    private var explanation: String {
+        switch model.displayedMode {
+        case .auto where model.externallyControlled:
+            return "Choose Auto to hand the fans back to macOS."
+        case .auto:
+            return "macOS controls the fans. Manual and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
+        case .manual:
+            return "Drag to change speed. Returns to Auto at 80°C, high thermal pressure, sleep, quit, or if monitoring fails."
+        case .maximum:
+            return "Fans run at full speed until you choose Auto, sleep, or quit."
+        }
+    }
+    private var thermalColor: Color {
+        guard model.colorsTemperatures else { return .secondary }
+        switch HeatLevel.normal.raised(by: thermalLevel()) {
+        case .normal: return .green
+        case .warm: return .yellow
+        case .hot: return .red
+        }
+    }
+    private func temperature(_ reading: TemperatureReading, value: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(reading == .battery ? "Battery" : reading.title).font(.caption).foregroundStyle(.secondary)
+            Text(value.map { String(format: "%.0f°C", $0) } ?? "—°C")
+                .font(.system(size: 26, weight: .medium, design: .rounded)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.7)
+                .foregroundStyle(model.heatLevel(reading, value).map(Color.init) ?? .primary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: CoolingModel
+    var body: some View {
+        Form {
+            Section {
+                ForEach(TemperatureReading.allCases, id: \.self) { reading in
+                    Toggle(reading.title, isOn: Binding(get: { model.menuBarReadings.contains(reading) },
+                                                        set: { _ in model.toggleMenuBar(reading) }))
+                        .disabled(model.menuBarReadings == [reading])  // At least one reading stays on.
                 }
-                .disabled(model.bounds == nil || model.sessionRunning)
-                if let bounds = model.bounds {
-                    Text("Hardware range: \(Int(ceil(bounds.minimum)))–\(Int(floor(bounds.maximum))) RPM")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                Toggle("Color temperatures green, yellow and red", isOn: $model.colorsTemperatures)
+            } header: {
+                Text("Menu Bar")
+            } footer: {
+                Text("Yellow and red start at 70°C and 85°C for CPU and GPU, 35°C and 40°C for battery, and 55°C and 70°C for SSD. High thermal pressure also turns readings yellow or red.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                TextField("Minimum RPM", text: $model.minimumText)
+                TextField("Maximum RPM", text: $model.maximumText)
                 if model.bounds != nil && !model.rangeIsValid {
                     Text("Enter a minimum below the maximum, within the hardware range.")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                Button("Apply speed for 60 seconds…") { model.applyManual() }
-                    .buttonStyle(.borderedProminent).disabled(!model.canApply)
-                Text("Manual control returns to Auto at 80°C or if monitoring fails. Start below 75°C. Your limits apply only to manual speed.")
+            } header: {
+                Text("Manual Speed Limits")
+            } footer: {
+                Text(model.bounds.map { "Sets the Manual slider's range. Your fan supports \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
+                     ?? "Reading fan limits…")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Button("Maximum cooling…") { model.maximumBoost() }
-                        .disabled(model.sessionRunning || model.fans.isEmpty || model.fans.contains(where: { $0.mode == 1 }))
-                    Spacer()
-                    Button("Auto") { model.endSession() }.disabled(!model.sessionRunning)
-                }
-                if let message = model.message {
-                    Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
-                }
-                Divider()
-                HStack { Spacer(); Button("Quit Parvanak", action: quit).buttonStyle(.plain).foregroundStyle(.secondary) }
             }
-            .padding(20)
+            .disabled(model.bounds == nil)
         }
-        .frame(width: 360, height: 570)
+        .formStyle(.grouped)
+        .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
     }
-    private func temperature(_ label: String, value: Double?) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            Text(value.map { String(format: "%.0f°C", $0) } ?? "—°C")
-                .font(.system(size: 26, weight: .medium, design: .rounded)).monospacedDigit()
+}
+
+extension Color {
+    init(_ level: HeatLevel) {
+        switch level {
+        case .normal: self = .green
+        case .warm: self = .yellow
+        case .hot: self = .red
         }
-        .accessibilityElement(children: .combine)
     }
-    private func limitField(_ label: String, text: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            TextField(label, text: text).textFieldStyle(.roundedBorder).accessibilityLabel(label)
+}
+extension NSColor {
+    static func heat(_ level: HeatLevel) -> NSColor {
+        switch level {
+        case .normal: return .systemGreen
+        case .warm: return .systemYellow
+        case .hot: return .systemRed
         }
     }
 }
 
-final class MenuApp: NSObject, NSApplicationDelegate {
+final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let model = CoolingModel()
     let popover = NSPopover()
     var timer: Timer?
+    // Changing the status item while its menu is open can dismiss the menu, so updates wait until it closes.
+    private var menuOpen = false
+    private var layoutPending = false
+    private var symbol = "fan"
     func applicationDidFinishLaunching(_ notification: Notification) {
         item.button?.image = NSImage(systemSymbolName: "fan", accessibilityDescription: "Parvanak")
+        item.button?.imagePosition = .imageLeading
+        fixStatusItemWidth()
         item.button?.setAccessibilityLabel("Parvanak temperature and fan controls")
-        item.button?.target = self; item.button?.action = #selector(togglePopover)
+        item.button?.target = self; item.button?.action = #selector(statusItemClicked)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: ControlsView(model: model, quit: { [weak self] in self?.quitApp() }))
-        model.onUpdate = { [weak self] in
-            guard let self else { return }
-            self.item.button?.title = self.model.temperatures.map { " \(Int($0.highest.rounded()))°C" } ?? " —°C"
-            self.item.button?.toolTip = "Parvanak · " + self.model.status
-        }
+        let host = NSHostingController(rootView: ControlsView(model: model, quit: { [weak self] in self?.quitApp() },
+                                                              openSettings: { [weak self] in self?.openSettings() }))
+        host.sizingOptions = .preferredContentSize
+        popover.contentViewController = host
+        model.onMenuBarLayoutChange = { [weak self] in self?.layoutPending = true; self?.refreshStatusItem() }
+        model.onUpdate = { [weak self] in self?.refreshStatusItem() }
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.model.refresh() }
         RunLoop.main.add(timer!, forMode: .common)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
+        removeStaleSessions()
         model.refresh()
+    }
+    /// Deletes session folders left by a crash, so no control files linger on disk.
+    private func removeStaleSessions() {
+        let temporary = FileManager.default.temporaryDirectory
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: temporary.path)) ?? []
+        where name.hasPrefix("parvanak-") {
+            try? FileManager.default.removeItem(at: temporary.appendingPathComponent(name))
+        }
+    }
+    private func refreshStatusItem() {
+        guard !menuOpen else { return }
+        if layoutPending { layoutPending = false; fixStatusItemWidth() } else { updateTitle() }
+        let wanted = model.displayedMode == .auto ? "fan" : "fan.fill"
+        if wanted != symbol {
+            symbol = wanted
+            item.button?.image = NSImage(systemSymbolName: wanted, accessibilityDescription: "Parvanak")
+        }
+        item.button?.toolTip = "Parvanak · " + model.status
+    }
+    private var titleFont: NSFont { .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
+    /// One reading shows " 72°C"; several show " C 72°  G 64°" with letter prefixes.
+    private func title(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSAttributedString {
+        let readings = model.menuBarReadings
+        let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
+        paragraph.lineBreakMode = .byClipping  // The default word wrap splits readings onto two lines.
+        let base: [NSAttributedString.Key: Any] = [.font: titleFont, .paragraphStyle: paragraph]
+        let text = NSMutableAttributedString()
+        for (index, reading) in readings.enumerated() {
+            if readings.count > 1 {
+                var label = base; label[.foregroundColor] = NSColor.secondaryLabelColor
+                text.append(NSAttributedString(string: (index == 0 ? " " : "  ") + reading.letter + " ", attributes: label))
+            } else { text.append(NSAttributedString(string: " ", attributes: base)) }
+            var attributes = base
+            if colored, let level = model.heatLevel(reading, value(reading)) {
+                attributes[.foregroundColor] = NSColor.heat(level)
+            }
+            let number = value(reading).map { String(Int($0.rounded())) } ?? "—"
+            text.append(NSAttributedString(string: number + (readings.count > 1 ? "°" : "°C"), attributes: attributes))
+        }
+        return text
+    }
+    private func updateTitle() {
+        item.button?.attributedTitle = title({ reading in self.model.temperatures.flatMap { reading.value(in: $0) } },
+                                             colored: true)
+    }
+    /// Sizes the item for the widest readings so it (and the popover anchored to it) never shifts as numbers change.
+    private func fixStatusItemWidth() {
+        guard let button = item.button else { return }
+        button.font = titleFont
+        button.alignment = .center
+        button.attributedTitle = title({ _ in 130 }, colored: false)
+        // Measure without a width limit; `fittingSize` is constrained by the current length.
+        let unbounded = NSRect(x: 0, y: 0, width: 10_000, height: NSStatusBar.system.thickness)
+        item.length = ceil(button.cell?.cellSize(forBounds: unbounded).width ?? button.fittingSize.width) + 4
+        updateTitle()
+    }
+    @objc func statusItemClicked() {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true { showMenu() }
+        else { togglePopover() }
+    }
+    func showMenu() {
+        popover.performClose(nil)
+        let menu = NSMenu()
+        func info(_ title: String) {
+            let entry = NSMenuItem(title: title, action: nil, keyEquivalent: ""); entry.isEnabled = false
+            menu.addItem(entry)
+        }
+        info(model.status)
+        if let temperatures = model.temperatures {
+            info(TemperatureReading.allCases.dropFirst().compactMap { reading in
+                reading.value(in: temperatures).map { "\(reading.title) \(Int($0.rounded()))°C" }
+            }.joined(separator: " · "))
+        }
+        for fan in model.fans { info("Fan \(fan.index + 1): \(Int(fan.rpm).formatted()) RPM") }
+        menu.addItem(.separator())
+        let busy = model.pending != nil || model.fans.isEmpty
+        for (title, mode) in [("Auto", FanMode.auto),
+                              ("Manual · \(Int(model.selectedRPM.rounded()).formatted()) RPM", .manual),
+                              ("Max", .maximum)] {
+            let entry = NSMenuItem(title: title, action: busy ? nil : #selector(selectMode(_:)), keyEquivalent: "")
+            entry.target = self; entry.representedObject = mode
+            entry.state = model.displayedMode == mode ? .on : .off
+            menu.addItem(entry)
+        }
+        menu.addItem(.separator())
+        let open = NSMenuItem(title: "Open Parvanak", action: #selector(togglePopover), keyEquivalent: "")
+        open.target = self; menu.addItem(open)
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self; menu.addItem(settings)
+        let quit = NSMenuItem(title: "Quit Parvanak", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self; menu.addItem(quit)
+        // Attach only while open so a left click still shows the popover.
+        menu.delegate = self
+        menuOpen = true
+        item.menu = menu
+        item.button?.performClick(nil)
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === item.menu else { return }
+        item.menu = nil
+        menuOpen = false
+        refreshStatusItem()
+    }
+    @objc func selectMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? FanMode else { return }
+        model.select(mode)
+        // Explain refusals (for example, too warm for Manual) where they are visible.
+        if model.message != nil, !popover.isShown { togglePopover() }
     }
     @objc func togglePopover() {
         guard let button = item.button else { return }
@@ -502,9 +904,38 @@ final class MenuApp: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
         }
     }
+    private var settingsWindow: NSWindow?
+    @objc func openSettings() {
+        popover.performClose(nil)
+        if settingsWindow == nil {
+            let host = NSHostingController(rootView: SettingsView(model: model))
+            host.sizingOptions = .preferredContentSize
+            let window = NSWindow(contentViewController: host)
+            window.title = "Parvanak Settings"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            settingsWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
     @objc func stop() { model.endSession() }
-    @objc func quitApp() { model.endSession(); NSApp.terminate(nil) }
-    func applicationWillTerminate(_ notification: Notification) { model.endSession() }
+    @objc func quitApp() { NSApp.terminate(nil) }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard model.sessionRunning else { return .terminateNow }
+        // Give the helper a moment to confirm Auto before exiting; it also restores Auto when this process ends.
+        model.endSession()
+        let deadline = Date().addingTimeInterval(5)
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] timer in
+            guard let self, self.model.sessionRunning, Date() < deadline else {
+                timer.invalidate(); sender.reply(toApplicationShouldTerminate: true); return
+            }
+        }
+        // Termination waits in a modal run loop mode, which `.common` includes.
+        RunLoop.main.add(timer, forMode: .common)
+        return .terminateLater
+    }
 }
 
 func diagnostic() -> String {
@@ -520,22 +951,19 @@ func diagnostic() -> String {
         return lines.joined(separator: "\n")
     } catch { return "Read-only diagnostic failed: \(error)" }
 }
-if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--diagnose" {
-    try? diagnostic().write(toFile: CommandLine.arguments[2], atomically: true, encoding: .utf8)
-} else if CommandLine.arguments.contains("--probe") {
+let arguments = CommandLine.arguments
+// No logs: nothing here writes readings to disk. `--probe` prints to the terminal only.
+if arguments.contains("--probe") {
     print(diagnostic())
-} else if (CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--boost") ||
-          (CommandLine.arguments.count == 7 && CommandLine.arguments[1] == "--control") {
+} else if arguments.count == 4 && arguments[1] == "--control" {
     do {
-        guard let parent = Int32(CommandLine.arguments[2]), parent > 1 else { throw Failure("Invalid parent") }
-        var request: ManualRequest?
-        if CommandLine.arguments[1] == "--control" {
-            guard let rpm = Double(CommandLine.arguments[4]), let minimum = Double(CommandLine.arguments[5]),
-                  let maximum = Double(CommandLine.arguments[6]) else { throw Failure("Invalid RPM limits") }
-            request = ManualRequest(rpm: rpm, minimum: minimum, maximum: maximum)
-        }
-        try coolingSession(parent: parent, stopPath: CommandLine.arguments[3], manual: request)
+        guard let parent = Int32(arguments[2]), parent > 1 else { throw Failure("Invalid parent") }
+        try coolingSession(parent: parent, directory: arguments[3])
     } catch { fputs("\(error)\n", stderr); exit(1) }
+} else if arguments.count == 2 && arguments[1] == "--watchdog" {
+    if geteuid() == 0 { watchdog() }
+} else if arguments.count == 2 && arguments[1] == "--restore" {
+    do { try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
 } else {
     let app = NSApplication.shared
     let delegate = MenuApp()

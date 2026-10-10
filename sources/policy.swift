@@ -24,44 +24,142 @@ struct Temperatures {
     let cpu: Double
     let gpu: Double
     let battery: Double?
+    let ssd: Double?
     var highest: Double { max(cpu, gpu) }
-    init(cpu: [Double], gpu: [Double], battery: [Double] = []) throws {
+    init(cpu: [Double], gpu: [Double], battery: [Double] = [], ssd: [Double] = []) throws {
         guard !cpu.isEmpty, !gpu.isEmpty else {
             throw Failure("CPU and GPU temperature sensors are required for manual control")
         }
-        let values = cpu + gpu + battery
+        let values = cpu + gpu + battery + ssd
         guard values.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 130 }) else {
             throw Failure("A temperature sensor returned an invalid value")
         }
-        self.cpu = cpu.max()!; self.gpu = gpu.max()!; self.battery = battery.max()
+        self.cpu = cpu.max()!; self.gpu = gpu.max()!; self.battery = battery.max(); self.ssd = ssd.max()
     }
 }
 
 enum ThermalLevel { case nominal, fair, serious, critical, unknown }
 
+/// Display colour band for a reading: green, yellow, red.
+enum HeatLevel: Int, Comparable {
+    case normal, warm, hot
+    static func < (a: HeatLevel, b: HeatLevel) -> Bool { a.rawValue < b.rawValue }
+    /// macOS thermal pressure can only raise the level, never lower it.
+    func raised(by thermal: ThermalLevel) -> HeatLevel {
+        switch thermal {
+        case .fair: return max(self, .warm)
+        case .serious, .critical: return .hot
+        case .nominal, .unknown: return self
+        }
+    }
+}
+
+/// Which temperature the menu bar shows.
+enum TemperatureReading: String, CaseIterable {
+    case hottest, cpu, gpu, battery, ssd
+    var title: String {
+        switch self {
+        case .hottest: return "Hottest (CPU or GPU)"
+        case .cpu: return "CPU"
+        case .gpu: return "GPU"
+        case .battery: return "Battery"
+        case .ssd: return "SSD"
+        }
+    }
+    /// One-letter prefix used when the menu bar shows several readings.
+    var letter: String {
+        switch self {
+        case .hottest: return "H"
+        case .cpu: return "C"
+        case .gpu: return "G"
+        case .battery: return "B"
+        case .ssd: return "S"
+        }
+    }
+    func value(in temperatures: Temperatures) -> Double? {
+        switch self {
+        case .hottest: return temperatures.highest
+        case .cpu: return temperatures.cpu
+        case .gpu: return temperatures.gpu
+        case .battery: return temperatures.battery
+        case .ssd: return temperatures.ssd
+        }
+    }
+    /// Display bands only; the cooling cutoffs live in `CoolingPolicy`.
+    func level(_ value: Double) -> HeatLevel {
+        let (warm, hot): (Double, Double)
+        switch self {
+        case .battery: (warm, hot) = (35, 40)
+        case .ssd: (warm, hot) = (55, 70)
+        case .hottest, .cpu, .gpu: (warm, hot) = (70, 85)
+        }
+        return value >= hot ? .hot : value >= warm ? .warm : .normal
+    }
+}
+
+/// What the helper should hold the fans at. The app rewrites it every second as a heartbeat.
+enum CoolingTarget: Equatable {
+    case manual(rpm: Double)
+    case maximum
+    var encoded: String {
+        switch self {
+        case .manual(let rpm): return "manual \(Int(rpm.rounded()))\n"
+        case .maximum: return "maximum\n"
+        }
+    }
+    init(encoded text: String) throws {
+        let parts = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        if parts == ["maximum"] { self = .maximum; return }
+        guard parts.count == 2, parts[0] == "manual", let rpm = Double(parts[1]), rpm.isFinite else {
+            throw Failure("Invalid cooling target")
+        }
+        self = .manual(rpm: rpm)
+    }
+}
+
+/// Detects a stalled app by watching for control-file updates on a monotonic clock,
+/// so changes to the system clock cannot hide a stall.
+struct Heartbeat {
+    private var stamp: Double?
+    private var updated = 0.0
+    /// `stamp` is the control file's modification time; `now` is monotonic seconds.
+    mutating func isFresh(stamp: Double, now: Double) -> Bool {
+        if stamp != self.stamp { self.stamp = stamp; updated = now }
+        return now - updated <= CoolingPolicy.heartbeatTimeout
+    }
+}
+
 struct CoolingPolicy {
-    static let sessionSeconds = 60
+    /// The helper returns fans to Auto when the app stops refreshing its target for this long.
+    static let heartbeatTimeout = 10.0
     // Conservative software cutoffs, not manufacturer-certified limits.
     static let startLimit = 75.0
     static let stopLimit = 80.0
+    static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
+        guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,
+              maximum <= hardware.maximum, minimum < maximum else {
+            throw Failure("Choose a minimum below the maximum, within the hardware range")
+        }
+    }
     static func validateRange(rpm: Double, minimum: Double, maximum: Double,
                               hardware: HardwareBounds) throws {
-        guard [rpm, minimum, maximum].allSatisfy({ $0.isFinite }),
-              minimum >= hardware.minimum, maximum <= hardware.maximum,
-              minimum < maximum, rpm >= minimum, rpm <= maximum else {
-            throw Failure("Choose ordered minimum and maximum limits within the hardware range, and an RPM inside those limits")
+        try validateLimits(minimum: minimum, maximum: maximum, hardware: hardware)
+        guard rpm.isFinite, rpm >= minimum, rpm <= maximum else {
+            throw Failure("Choose a speed inside your minimum and maximum limits")
         }
     }
     static func validateTemperature(_ temperatures: Temperatures?, thermal: ThermalLevel,
                                     starting: Bool) throws {
         guard let temperatures else { throw Failure("Temperature readings are unavailable; keeping automatic cooling") }
         guard thermal == .nominal || thermal == .fair else {
-            throw Failure("Thermal pressure is high; returning to automatic cooling")
+            throw Failure(starting ? "Thermal pressure is high; manual speed is unavailable"
+                                   : "Thermal pressure is high; returning to automatic cooling")
         }
         let limit = starting ? startLimit : stopLimit
         guard temperatures.highest < limit,
               temperatures.battery.map({ $0 < 45 }) ?? true else {
-            throw Failure("Temperature is high; returning to automatic cooling")
+            throw Failure(starting ? "Manual speed starts below \(Int(startLimit))°C. Use Max to cool down first."
+                                   : "Temperature is high; returning to automatic cooling")
         }
     }
 }
