@@ -333,10 +333,22 @@ func coolingSession(parent: pid_t, directory: String) throws {
             writeAutomatic: { try smc.write($0, expectedType: "ui8 ", bytes: [0]) },
             retryDelay: { usleep(100_000) })
     }
+    /// Targets written recently. The SMC applies a new target a moment after the write and can drop one that follows
+    /// another closely, so reading back the latest or any written within `settle` still means Baadgir holds the fan;
+    /// any other value means something else changed it.
+    var written: [(targets: [Float], at: ContinuousClock.Instant)] = []
+    let settle = Duration.seconds(5)
     /// Per-fan targets while Baadgir holds the fans; nil while macOS controls them (Curve mode only).
-    var applied: [Float]?
+    var applied: [Float]? {
+        didSet {
+            guard let applied else { return }
+            written.removeAll { $0.at.duration(to: .now) > settle }
+            written.append((applied, .now))
+        }
+    }
     /// Puts every fan in manual mode, writing the target first so no fan runs a stale value.
-    func engage(_ targets: [Float]) throws {
+    /// Returns false when the app chose Auto or quit while waiting for the fan controller.
+    func engage(_ targets: [Float]) throws -> Bool {
         for (fan, rpm) in zip(fans, targets) {
             if !touched.contains(where: { $0.index == fan.index }) { touched.append(fan) }
             // The SMC can take a moment to apply the mode, and briefly reject writes while it does.
@@ -352,11 +364,15 @@ func coolingSession(parent: pid_t, directory: String) throws {
                 if attempt == 39 {
                     throw Failure("Fan controller did not confirm the requested speed (fan \(fan.index): \(detail))")
                 }
+                // Stop waiting as soon as the app chooses Auto, quits, or stops sending heartbeats.
+                if interrupted != 0 || cancelled() { return false }
+                _ = try requestedTarget()
                 try pulse()
                 usleep(200_000)
             }
         }
         applied = targets
+        return true
     }
     var curveController = CurveController()
     do {
@@ -399,7 +415,9 @@ func coolingSession(parent: pid_t, directory: String) throws {
             if let wanted {
                 if applied == nil {
                     // Manual and Max start at maximum, never a stale low target; Curve starts above macOS's speed.
-                    if case .curve = target { try engage(wanted) } else { try engage(fans.map(\.maximum)) }
+                    let start: [Float]
+                    if case .curve = target { start = wanted } else { start = fans.map(\.maximum) }
+                    guard try engage(start) else { break }
                     // Engaging can take seconds; don't mistake that for sleep or a fan that didn't respond.
                     previous = clock.now; changed = previous
                 }
@@ -425,9 +443,17 @@ func coolingSession(parent: pid_t, directory: String) throws {
                     continue
                 }
                 let expected = applied[index], target = try smc.number("F\(fan.index)Tg")
-                guard fan.mode == 1, abs(target - expected) <= 1 else {
-                    throw Failure("System reclaimed fan control; session ended "
-                                  + "(fan \(fan.index): mode \(fan.mode), target \(Int(target)) RPM)")
+                let ours = written.indices.contains {
+                    ($0 == written.count - 1 || written[$0].at.duration(to: now) <= settle)
+                        && abs(target - written[$0].targets[index]) <= 1
+                }
+                guard fan.mode == 1, ours else {
+                    throw Failure("System reclaimed fan control; session ended (fan \(fan.index): mode \(fan.mode), "
+                                  + "target \(Int(target)) RPM, wanted \(Int(expected)) RPM)")
+                }
+                // Still on an earlier target a second after the latest write: send it again in case the SMC dropped it.
+                if abs(target - expected) > 1, let last = written.last, last.at.duration(to: now) > .seconds(1) {
+                    try smc.target(original, rpm: expected)
                 }
                 if changed.duration(to: now) > .seconds(5), fan.rpm < max(300, expected * 0.35) {
                     throw Failure("Fan speed did not respond; returning to automatic cooling")
