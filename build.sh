@@ -43,6 +43,17 @@ if [[ "${1:-}" == "--install" ]]; then
   # Installed first, so a cancelled password prompt leaves the running app untouched.
   sudo mkdir -p /Library/PrivilegedHelperTools
   sudo install -o root -g wheel -m 755 'Baadgir.app/Contents/MacOS/baadgir' /Library/PrivilegedHelperTools/local.baadgir.helper
+  # Password-free fan control: lets only you run only this root-owned helper, only in the app's two forms, without a
+  # password. Checked with visudo before installing, since a broken sudoers file stops sudo working. No dot in the
+  # file name: sudo skips those.
+  sudoers="$(mktemp)"
+  print -r -- "$(id -un) ALL=(root) NOPASSWD: /usr/bin/env -i /Library/PrivilegedHelperTools/local.baadgir.helper --control *, /usr/bin/env -i /Library/PrivilegedHelperTools/local.baadgir.helper --restore" > "$sudoers"
+  if sudo visudo -cqf "$sudoers"; then
+    sudo install -o root -g wheel -m 440 "$sudoers" /etc/sudoers.d/baadgir
+  else
+    echo 'Could not set up password-free fan control; Baadgir will ask for your password each time.' >&2
+  fi
+  rm -f "$sudoers"
   # Quit every running copy first, wherever it was started; it restores automatic cooling before exiting. Matched by
   # bundle ID, like the app's own one-copy check, so a copy still running would also make the new one quit at launch.
   running() { [[ -n "$(lsappinfo find bundleid=local.baadgir)" ]] }

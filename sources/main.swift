@@ -621,7 +621,7 @@ final class CoolingModel: ObservableObject {
     @Published var hotKeyError: String?
     var onHotKeyChange: (() -> Void)?
     /// Whether baadgir:// links (and so Shortcuts and the command line) may change the fan mode.
-    /// Off until turned on: any web page or app can open a link, and starting a session asks for the administrator password.
+    /// Off until turned on: any web page or app can open a link.
     @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
@@ -657,14 +657,15 @@ final class CoolingModel: ObservableObject {
             }
             wanted = .manual
         }
-        // Any web page can open a link. Starting cooling raises the administrator prompt, and Manual can run the fans slower
-        // than macOS would, so both need a click here first; Max or Curve inside a running session and Auto don't.
+        // Any web page can open a link. Starting cooling needs no password once password-free control is set up, and Manual
+        // can run the fans slower than macOS would, so both need a click here first; Max or Curve inside a running session
+        // and Auto don't.
         var rpm: Double?
         if case .manual(let requested) = command { rpm = requested ?? selectedRPM.rounded() }
         if wanted == .manual || (wanted != .auto && !sessionRunning),
            confirmRemote?(wanted, rpm, !sessionRunning) != true { return }
         if case .manual(let rpm?) = command { selectedRPM = rpm }
-        select(wanted)
+        choose(wanted)
     }
     @Published var rules = PowerRules(
         autoOnBattery: UserDefaults.standard.bool(forKey: "autoOnBattery"),
@@ -896,7 +897,9 @@ final class CoolingModel: ObservableObject {
                 if self.sessionRunning && [.manual, .curve].contains(self.mode) && temperatures == nil {
                     self.endSession(reason: "Temperature readings stopped: \(errorMessage)")
                 }
-                // After limits and the curve are loaded, so a rule can start Curve at launch.
+                // After limits and the curve are loaded, so the last mode or a rule can start Curve at launch. The last
+                // mode first: a plugged-in rule only starts from Auto, so it never overrides it.
+                self.restoreLastMode()
                 self.applyRules()
                 self.onUpdate?()
             }
@@ -905,6 +908,22 @@ final class CoolingModel: ObservableObject {
 
     // MARK: Mode changes
 
+    /// A mode picked by hand, from the popover, the menu, the hot key or a link. Remembered so Baadgir starts it again
+    /// when it next opens; modes set by rules, returns to Auto for safety, sleep and quitting don't change it.
+    func choose(_ newMode: FanMode) {
+        defaults.set(newMode.rawValue, forKey: "lastMode")
+        select(newMode)
+    }
+    private var restoredLastMode = false
+    /// Once at launch, after limits and the curve are loaded: starts the mode last picked by hand.
+    private func restoreLastMode() {
+        guard !restoredLastMode, initializedLimits, pending == nil else { return }
+        restoredLastMode = true
+        guard let last = defaults.string(forKey: "lastMode").flatMap(FanMode.init(rawValue:)), last != .auto,
+              !fanless, !sessionRunning, !externallyControlled, last != .manual || advanced,
+              rules.blocker(for: last, on: currentPowerSource()) == nil else { return }
+        select(last)
+    }
     func select(_ newMode: FanMode) {
         message = nil
         if fanless, newMode != .auto {
@@ -999,8 +1018,8 @@ final class CoolingModel: ObservableObject {
             try? FileManager.default.removeItem(at: directory)
             if success { self.message = nil }
         }
-        if started {
-            pending = "Waiting for administrator authorization…"
+        if let started {
+            pending = started == .prompted ? "Waiting for administrator authorization…" : "Starting fan control…"
             activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
                                                              reason: "Baadgir is controlling the fans")
         } else {
@@ -1021,26 +1040,43 @@ final class CoolingModel: ObservableObject {
     }
     private func restoreAutomaticControl() {
         guard helper == nil else { return }
-        if runPrivileged(["--restore"], completion: { [weak self] _, _ in self?.pending = nil }) {
+        if runPrivileged(["--restore"], completion: { [weak self] _, _ in self?.pending = nil }) != nil {
             pending = "Restoring automatic cooling…"
         }
     }
-    /// Runs the root-owned helper as root through an administrator prompt. Returns false if it could not launch.
-    private func runPrivileged(_ arguments: [String], completion: @escaping (Bool, String) -> Void) -> Bool {
-        // Never hand the administrator password to a file that another app running as this user could replace.
+    /// How the helper was started: through the sudo rule that ./build.sh --install sets up, or through an
+    /// administrator prompt when that rule is missing.
+    enum PrivilegedLaunch { case direct, prompted }
+    /// The sudo rule letting this user run the helper without a password. No dot in the name: sudo skips those.
+    private let sudoRulePath = "/etc/sudoers.d/baadgir"
+    /// Whether starting a session raises the administrator prompt.
+    var needsPassword: Bool { !FileManager.default.fileExists(atPath: sudoRulePath) }
+    /// Runs the root-owned helper as root. Returns nil if it could not launch.
+    private func runPrivileged(_ arguments: [String], completion: @escaping (Bool, String) -> Void) -> PrivilegedLaunch? {
+        // Never run as root, or hand the administrator password to, a file that another app running as this user could replace.
         guard isRootOwned(helperPath) else {
-            message = "The fan-control helper is not installed. Run ./build.sh --install."; return false
+            message = "The fan-control helper is not installed. Run ./build.sh --install."; return nil
         }
         guard let executable = Bundle.main.executablePath,
               FileManager.default.contentsEqual(atPath: executable, andPath: helperPath) else {
-            message = "The fan-control helper doesn't match this Baadgir. Run ./build.sh --install."; return false
+            message = "The fan-control helper doesn't match this Baadgir. Run ./build.sh --install."; return nil
         }
         // An empty environment: nothing set for this user's apps (such as via `launchctl setenv`) reaches root.
-        let command = (["/usr/bin/env", "-i", helperPath] + arguments).map(shellQuote).joined(separator: " ")
-        let literal = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let command = ["/usr/bin/env", "-i", helperPath] + arguments
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "do shell script \"\(literal)\" with administrator privileges"]
+        let launch: PrivilegedLaunch
+        if !needsPassword {
+            // -n: fail rather than wait for a password nobody can type.
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            process.arguments = ["-n"] + command
+            launch = .direct
+        } else {
+            let literal = command.map(shellQuote).joined(separator: " ")
+                .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", "do shell script \"\(literal)\" with administrator privileges"]
+            launch = .prompted
+        }
         let errors = Pipe(); process.standardError = errors
         process.terminationHandler = { [weak self] completed in
             let error = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
@@ -1057,15 +1093,18 @@ final class CoolingModel: ObservableObject {
             }
         }
         do { try process.run() }
-        catch { message = String(describing: error); return false }
+        catch { message = String(describing: error); return nil }
         helper = process
-        return true
+        return launch
     }
     private func shellQuote(_ text: String) -> String {
         "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
     private static func readableError(_ text: String) -> String {
         if text.contains("(-128)") { return "Administrator authorization was cancelled." }
+        if text.contains("a password is required") {
+            return "Password-free fan control isn't set up for this account. Run ./build.sh --install again."
+        }
         var text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let range = text.range(of: "execution error: ") { text = String(text[range.upperBound...]) }
         if let range = text.range(of: #" \(-?\d+\)$"#, options: .regularExpression) { text.removeSubrange(range) }
@@ -1126,7 +1165,7 @@ struct PopoverView: View {
                 Text("This Mac has no fans. macOS cools it by slowing the chip down when it gets hot.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
-                Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.select($0) })) {
+                Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.choose($0) })) {
                     Text("Auto").tag(FanMode.auto)
                     Text("Curve").tag(FanMode.curve)
                     if model.offersManual { Text("Manual").tag(FanMode.manual) }
@@ -1184,7 +1223,7 @@ struct PopoverView: View {
         case .auto where model.externallyControlled:
             return "Choose Auto to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. \(model.advanced ? "Curve, Manual, and Max ask" : "Curve and Max ask") for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
+            return "macOS controls the fans. \(model.advanced ? "Curve, Manual, and Max stay" : "Curve and Max stay") on until you choose Auto, and start again when Baadgir opens. Right-click the menu bar icon for quick switching."
         case .curve:
             return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Returns to Auto on sleep or quit."
         case .manual:
@@ -1811,7 +1850,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         runQueuedCommands()
     }
     private var confirming = false
-    /// Asks before a link, Shortcut, or command starts cooling, so a web page can't raise the password prompt on its own,
+    /// Asks before a link, Shortcut, or command starts cooling, so a web page can't take over the fans on its own,
     /// or picks a manual speed, so it can't slow the fans on its own.
     private func confirmRemote(_ mode: FanMode, rpm: Double?, startsSession: Bool) -> Bool {
         // One question at a time; requests that arrive meanwhile are declined.
@@ -1828,7 +1867,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         let alert = NSAlert()
         if startsSession {
             alert.messageText = "Start \(name) cooling?"
-            alert.informativeText = "A link, Shortcut, or command asked Baadgir to take over the fans. If you continue, macOS asks for your administrator password."
+            alert.informativeText = "A link, Shortcut, or command asked Baadgir to take over the fans."
+                + (model.needsPassword ? " If you continue, macOS asks for your administrator password." : "")
         } else {
             alert.messageText = "Switch to \(name)?"
             alert.informativeText = "A link, Shortcut, or command asked Baadgir to change the fan speed. Manual can run the fans slower than macOS would."
@@ -1854,7 +1894,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         if model.message != nil, !popover.isShown { togglePopover() }
     }
     private func toggleMaximum() {
-        model.select(model.displayedMode == .maximum ? .auto : .maximum)
+        model.choose(model.displayedMode == .maximum ? .auto : .maximum)
         showMessage()
     }
     // Menu bar apps count as active while their popover is open; show banners anyway.
@@ -2047,7 +2087,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     }
     @objc func selectMode(_ sender: NSMenuItem) {
         guard let mode = sender.representedObject as? FanMode else { return }
-        model.select(mode)
+        model.choose(mode)
         // Explain refusals (for example, too warm for Manual) where they are visible.
         if model.message != nil, !popover.isShown { togglePopover() }
     }

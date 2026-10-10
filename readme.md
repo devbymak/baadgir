@@ -47,7 +47,7 @@ cd baadgir
 ./build.sh --install
 ```
 
-This builds the app, installs a small root-owned fan-control helper (macOS asks for your password once), and copies Baadgir to `/Applications`. Temperature monitoring alone needs no password.
+This builds the app, installs a small root-owned fan-control helper, and copies Baadgir to `/Applications`. It asks for your password once, to install the helper and a sudo rule (`/etc/sudoers.d/baadgir`) that lets your account start only that helper without a password. After that, Baadgir switches modes without asking and starts the mode you last picked when it opens.
 
 **Supported Macs:** Apple silicon Macs with fans, including two-fan 14" and 16" MacBook Pro models (both fans move together). On a fanless MacBook Air, Baadgir shows temperatures only. Run `baadgir status` to see the chip, fans and sensors it found.
 
@@ -73,7 +73,7 @@ Turn on Settings → Automation → Shortcuts, links, and command line first. It
 Choose Auto, quit Baadgir, delete the app, then run:
 
 ```sh
-sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baadgir.lock
+sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baadgir.lock /etc/sudoers.d/baadgir
 ```
 
 </details>
@@ -90,7 +90,7 @@ sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baa
 - **Manual** only starts below 75°C, never goes under 1000 RPM, and returns to Auto at 80°C, a hot battery or SSD, high thermal pressure or a sensor failure.
 - **Max** has no cutoff because it never lowers fan speed.
 - **Watchdogs:** the root helper restores Auto if the app stops responding for 10 seconds, and a separate watchdog restores Auto if the helper itself stalls for 15 seconds.
-- **Least privilege:** only a root-owned helper runs as root, never the app bundle, and the app checks that helper before asking for your password. Apple's thermal services are never disabled.
+- **Least privilege:** only a root-owned helper runs as root, never the app bundle, and the app checks that helper before starting it. The sudo rule covers only that helper, so any app running as you can start it without a password, but only within the limits above. Apple's thermal services are never disabled.
 
 These are conservative software limits, not certified safety limits. If automatic control can't be restored, restart your Mac. Don't run other fan-control apps at the same time.
 
