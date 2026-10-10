@@ -1363,16 +1363,13 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         model.refreshLoginItemStatus()
         if settingsWindow == nil {
             let host = NSHostingController(rootView: SettingsView(model: model))
-            host.sizingOptions = .standardBounds
+            host.sizingOptions = .preferredContentSize
             let window = NSWindow(contentViewController: host)
             window.title = "Baadgir Settings"
-            window.styleMask = [.titled, .closable, .resizable]
+            window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
-            // The form is taller than many screens: fit the window to the screen and let the form scroll,
-            // sizing it before centering so it doesn't grow off-center afterward.
-            let ideal = NSHostingView(rootView: SettingsView(model: model).fixedSize(horizontal: false, vertical: true)).fittingSize
-            let available = (NSScreen.main?.visibleFrame.height ?? ideal.height) - 60
-            window.setContentSize(NSSize(width: ideal.width, height: min(ideal.height, available)))
+            // Size to the SwiftUI content first; centering the default-sized window leaves it off-center once it grows.
+            window.setContentSize(host.view.fittingSize)
             window.center()
             settingsWindow = window
         }
@@ -1418,14 +1415,13 @@ Usage: baadgir status | auto | curve | max | manual [RPM]
   status        Print fan and sensor readings (read-only).
   auto … max    Ask the running Baadgir app to change fan mode, with the same checks as the app.
 """
-/// Sends a request to this Baadgir.app (launching it if needed) through its baadgir:// link.
+let bundleIdentifier = "local.baadgir"
+/// Sends a request to the running Baadgir (launching the installed copy if needed) through its baadgir:// link.
 func send(_ command: RemoteCommand) -> Int32 {
     let open = Process()
     open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    // Resolve a symlink such as /usr/local/bin/baadgir back to this app, not another copy.
-    let executable = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0]).resolvingSymlinksInPath()
-    let bundle = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    open.arguments = ["-g"] + (bundle.pathExtension == "app" ? ["-a", bundle.path] : []) + [command.url.absoluteString]
+    // By bundle ID, so the request reaches the copy that is already running rather than starting another.
+    open.arguments = ["-g", "-b", bundleIdentifier, command.url.absoluteString]
     do { try open.run(); open.waitUntilExit() } catch { fputs("\(error)\n", stderr); return 1 }
     return open.terminationStatus
 }
@@ -1446,6 +1442,10 @@ if arguments.contains("--probe") || arguments.dropFirst() == ["status"] {
 } else if arguments.count >= 2, !arguments[1].hasPrefix("-") {
     // Plain words are commands; anything starting with "-" may come from macOS when it launches the app.
     fputs(usage + "\n", stderr); exit(arguments[1] == "help" ? 0 : 2)
+} else if NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+            .contains(where: { $0.processIdentifier != getpid() }) {
+    // Two copies would delete each other's session folders and fight over the fans.
+    fputs("Baadgir is already running.\n", stderr)
 } else {
     let app = NSApplication.shared
     let delegate = MenuApp()

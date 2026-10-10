@@ -30,9 +30,10 @@ Requires an Apple silicon Mac, macOS 13+, and Xcode Command Line Tools.
 
 ```sh
 ./test.sh
-./build.sh
-open Baadgir.app
+./build.sh --install   # builds, replaces /Applications/Baadgir.app, and opens it
 ```
+
+`./build.sh` alone builds `Baadgir.app` here without installing it. Only one copy runs at a time; a second launch quits immediately.
 
 Fan control requires macOS administrator authorization. Monitoring does not.
 
@@ -41,9 +42,9 @@ Fan control requires macOS administrator authorization. Monitoring does not.
 In Shortcuts, add an **Open URLs** action with a link such as `baadgir://max`. For the terminal, link the executable onto your `PATH`:
 
 ```sh
-ln -s "$PWD/Baadgir.app/Contents/MacOS/baadgir" /usr/local/bin/baadgir
+ln -s /Applications/Baadgir.app/Contents/MacOS/baadgir /usr/local/bin/baadgir
 baadgir status        # read-only readings
-baadgir manual 3000   # asks the running app; it launches if needed
+baadgir manual 3000   # asks the running app; it launches the installed copy if needed
 ```
 
 ## Safety

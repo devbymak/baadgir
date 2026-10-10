@@ -33,3 +33,14 @@ cat > 'Baadgir.app/Contents/Info.plist' <<'PLIST'
 PLIST
 codesign --force --sign - 'Baadgir.app'
 echo 'Built Baadgir.app'
+if [[ "${1:-}" == "--install" ]]; then
+  # Quit the running copy first; it restores automatic cooling before exiting.
+  osascript -e 'if application id "local.baadgir" is running then tell application id "local.baadgir" to quit' >/dev/null
+  for _ in {1..50}; do pgrep -qf '/Applications/Baadgir.app/Contents/MacOS/baadgir$' || break; sleep 0.2; done
+  rm -rf '/Applications/Baadgir.app'
+  ditto 'Baadgir.app' '/Applications/Baadgir.app'
+  # Only the installed copy should handle baadgir:// links and Launch at Login.
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$PWD/Baadgir.app"
+  open '/Applications/Baadgir.app'
+  echo 'Installed and opened /Applications/Baadgir.app'
+fi
