@@ -9,6 +9,7 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 ## Features
 
 - CPU/GPU/battery/SSD temperatures, fan RPM, and macOS thermal pressure, coloured green/yellow/red.
+- System power draw and adapter input in watts (display only).
 - Settings window (popover → Settings…, or right-click → Settings…) for launch at login, menu bar readings, colours, and manual speed limits.
 - Last 10 minutes of CPU/GPU temperature and fan speed as small graphs in the popover, kept in memory only.
 - No logs: readings and errors are never written to disk. Only preferences (limits, speed, menu bar choices) are saved.

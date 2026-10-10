@@ -95,6 +95,11 @@ final class SMC {
                                 battery: batteryKeys.map { Double(try number($0)) },
                                 ssd: ssdKeys.map { Double(try number($0)) })
     }
+    /// System and adapter power from the SMC (`PSTR`, `PDTR`). Display only; never used for control.
+    func power() throws -> PowerReadings {
+        let system = Double(try number("PSTR"))
+        return try PowerReadings(system: system, adapter: (try? number("PDTR")).map(Double.init))
+    }
     func fans() throws -> [Fan] {
         let count = try number("FNum")
         guard count >= 1, count <= 8, count.rounded() == count else { throw Failure("No supported fans") }
@@ -373,6 +378,7 @@ enum FanMode: Hashable { case auto, curve, manual, maximum }
 final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
     @Published var temperatures: Temperatures?
+    @Published var power: PowerReadings?
     @Published var sensorError = "Reading sensors…"
     @Published var minimumText = "1000" { didSet { limitsChanged() } }
     @Published var maximumText = "6000" { didSet { limitsChanged() } }
@@ -557,19 +563,21 @@ final class CoolingModel: ObservableObject {
             guard let self else { return }
             var fans: [Fan] = []
             var temperatures: Temperatures?
+            var power: PowerReadings?
             var errorMessage = ""
             do {
                 if self.smc == nil { self.smc = try SMC() }
                 fans = try self.smc!.fans()
                 do { temperatures = try self.smc!.temperatures() }
                 catch { errorMessage = String(describing: error) }
+                power = try? self.smc!.power()
             } catch {
                 self.smc = nil
                 errorMessage = String(describing: error)
             }
             DispatchQueue.main.async {
                 self.reading = false
-                self.fans = fans; self.temperatures = temperatures; self.sensorError = errorMessage
+                self.fans = fans; self.temperatures = temperatures; self.power = power; self.sensorError = errorMessage
                 self.history.append(HistorySample(cpu: temperatures?.cpu, gpu: temperatures?.gpu,
                     fan: fans.isEmpty ? nil : fans.map { Double($0.rpm) }.reduce(0, +) / Double(fans.count)))
                 self.bounds = try? HardwareBounds(ranges: fans.map { (Double($0.minimum), Double($0.maximum)) })
@@ -758,6 +766,11 @@ struct ControlsView: View {
             HStack(spacing: 0) {
                 Text("Thermal pressure: ").foregroundStyle(.secondary)
                 Text(model.thermalText).foregroundStyle(thermalColor)
+                Spacer()
+                if let power = model.power {
+                    Text("Power: ").foregroundStyle(.secondary)
+                    Text(power.text).monospacedDigit()
+                }
             }
             .font(.caption)
             if model.showsHistory { HistoryView(samples: model.history.elements, fanMaximum: model.bounds?.maximum) }
@@ -1165,6 +1178,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             }.joined(separator: " · "))
         }
         for fan in model.fans { info("Fan \(fan.index + 1): \(Int(fan.rpm).formatted()) RPM") }
+        if let power = model.power { info("Power: " + power.text) }
         menu.addItem(.separator())
         let busy = model.pending != nil || model.fans.isEmpty
         for (title, mode) in [("Auto", FanMode.auto),
@@ -1257,6 +1271,8 @@ func diagnostic() -> String {
             let temperatures = try smc.temperatures()
             lines.append("CPU \(temperatures.cpu)°C · GPU \(temperatures.gpu)°C")
         } catch { lines.append("Temperature readings unavailable: \(error)") }
+        do { lines.append("Power: " + (try smc.power()).text) }
+        catch { lines.append("Power readings unavailable: \(error)") }
         return lines.joined(separator: "\n")
     } catch { return "Read-only diagnostic failed: \(error)" }
 }

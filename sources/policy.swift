@@ -38,6 +38,25 @@ struct Temperatures {
     }
 }
 
+/// Power draw in watts. Display only.
+struct PowerReadings {
+    /// Whole-system draw.
+    let system: Double
+    /// Power coming in from the adapter; nil when unplugged or unavailable.
+    let adapter: Double?
+    init(system: Double, adapter: Double?) throws {
+        guard [system, adapter ?? 0].allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 500 }) else {
+            throw Failure("A power sensor returned an invalid value")
+        }
+        self.system = system
+        // Adapter keys read a trickle when unplugged.
+        self.adapter = adapter.flatMap { $0 >= 0.5 ? $0 : nil }
+    }
+    var text: String {
+        String(format: "%.1f W", system) + (adapter.map { String(format: " · adapter %.1f W", $0) } ?? "")
+    }
+}
+
 enum ThermalLevel { case nominal, fair, serious, critical, unknown }
 
 /// Display colour band for a reading: green, yellow, red.

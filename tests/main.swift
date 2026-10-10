@@ -166,4 +166,9 @@ for value in 1...2 { ring.append(value) }
 check(ring.elements == [1, 2], "History keeps order before it fills")
 for value in 3...7 { ring.append(value) }
 check(ring.elements == [5, 6, 7] && ring.count == 3, "History drops the oldest samples once full")
+let plugged = try PowerReadings(system: 25.76, adapter: 28.34)
+check(plugged.text == "25.8 W · adapter 28.3 W", "Power text with adapter")
+try check(try PowerReadings(system: 9, adapter: 0.1).adapter == nil, "Ignore adapter trickle when unplugged")
+rejects("Invalid power reading") { _ = try PowerReadings(system: .nan, adapter: nil) }
+rejects("Implausible power reading") { _ = try PowerReadings(system: 900, adapter: nil) }
 print("Passed \(checks) safety and sensor-decoding checks. No hardware writes.")
