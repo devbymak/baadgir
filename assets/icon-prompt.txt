@@ -1,3 +1,8 @@
-Generated with the built-in imagegen tool.
+Generated with the built-in image_gen tool.
 
-A macOS app icon for Baadgir: a sculptural five-bladed cooling fan inspired by butterfly wings; frosted mint and icy blue blades, midnight-blue rounded-square tile, subtle highlights, clear small-size silhouette, transparent corners, no text.
+Use case: logo-brand
+Asset type: finished minimalist macOS app icon for Baadgir, a temperature monitor and cooling-fan controller.
+Primary request: One unmistakable cooling fan emblem: exactly three broad softly curved blades arranged with perfect threefold rotational symmetry around a small circular central hub. Blades should resemble the actual rounded paddle blades of a cooling fan, not petals, a recycling symbol, or a propeller with pointed ends. A simple calm silhouette, clear gaps between blades, beautifully balanced geometry. One unified mint-teal #67DCC5 emblem. Use a small navy circle at the center as a simple hub opening if needed.
+Composition: emblem centered on a flat midnight navy #101B32 macOS rounded-square tile. Tile occupies 80 percent of square canvas with true transparent margin outside. Fan occupies 48 percent of canvas width and height, with ample breathing room inside tile. Match the visual simplicity of an app icon consisting only of two flat colored upload/download arrows on navy.
+Style: precise flat geometric shapes, soft rounded curves, solid colors, crisp edges, modern native utility app.
+Constraints: no thermometer, no gauge, no graph, no numbers, no text, no tower, no wind lines, no outer fan cage, no screws, no metallic hub, no small details, no gradients, no shadows, no bevels, no gloss, no glass, no textures, no 3D. No presentation sheet or mockup. Single finished app icon. Actual transparent background outside rounded square.
