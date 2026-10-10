@@ -339,10 +339,21 @@ func coolingSession(parent: pid_t, directory: String) throws {
     func engage(_ targets: [Float]) throws {
         for (fan, rpm) in zip(fans, targets) {
             if !touched.contains(where: { $0.index == fan.index }) { touched.append(fan) }
-            try smc.target(fan, rpm: rpm)
-            try smc.mode(fan, 1)
-            guard try smc.number(fan.modeKey) == 1, abs(try smc.number("F\(fan.index)Tg") - rpm) <= 1 else {
-                throw Failure("Fan controller did not confirm the requested speed")
+            // The SMC can take a moment to apply the mode, and briefly reject writes while it does.
+            var detail = ""
+            for attempt in 0..<40 {
+                do {
+                    try smc.target(fan, rpm: rpm)
+                    try smc.mode(fan, 1)
+                    let mode = try smc.number(fan.modeKey), target = try smc.number("F\(fan.index)Tg")
+                    if mode == 1, abs(target - rpm) <= 1 { break }
+                    detail = "mode \(Int(mode)), target \(Int(target)) RPM, wanted \(Int(rpm)) RPM"
+                } catch { detail = String(describing: error) }
+                if attempt == 39 {
+                    throw Failure("Fan controller did not confirm the requested speed (fan \(fan.index): \(detail))")
+                }
+                try pulse()
+                usleep(200_000)
             }
         }
         applied = targets
@@ -389,7 +400,8 @@ func coolingSession(parent: pid_t, directory: String) throws {
                 if applied == nil {
                     // Manual and Max start at maximum, never a stale low target; Curve starts above macOS's speed.
                     if case .curve = target { try engage(wanted) } else { try engage(fans.map(\.maximum)) }
-                    changed = now
+                    // Engaging can take seconds; don't mistake that for sleep or a fan that didn't respond.
+                    previous = clock.now; changed = previous
                 }
                 if wanted != applied {
                     // Only a faster target needs time to spin up. A slower one leaves the fans above it, so the response
@@ -412,9 +424,10 @@ func coolingSession(parent: pid_t, directory: String) throws {
                     guard fan.mode != 1 else { throw Failure("Another app took control of a fan; session ended") }
                     continue
                 }
-                let expected = applied[index]
-                guard fan.mode == 1, abs(try smc.number("F\(fan.index)Tg") - expected) <= 1 else {
-                    throw Failure("System reclaimed fan control; session ended")
+                let expected = applied[index], target = try smc.number("F\(fan.index)Tg")
+                guard fan.mode == 1, abs(target - expected) <= 1 else {
+                    throw Failure("System reclaimed fan control; session ended "
+                                  + "(fan \(fan.index): mode \(fan.mode), target \(Int(target)) RPM)")
                 }
                 if changed.duration(to: now) > .seconds(5), fan.rpm < max(300, expected * 0.35) {
                     throw Failure("Fan speed did not respond; returning to automatic cooling")
