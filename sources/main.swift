@@ -4,6 +4,7 @@ import IOKit
 import Darwin
 import ServiceManagement
 import UserNotifications
+import Carbon.HIToolbox
 
 struct Fan {
     let index: Int
@@ -428,6 +429,12 @@ final class CoolingModel: ObservableObject {
     @Published var showsHistory = UserDefaults.standard.object(forKey: "showsHistory") as? Bool ?? true {
         didSet { defaults.set(showsHistory, forKey: "showsHistory") }
     }
+    /// ⌃⌥M switches between Max and Auto from anywhere.
+    @Published var usesMaxHotKey = UserDefaults.standard.object(forKey: "usesMaxHotKey") as? Bool ?? true {
+        didSet { defaults.set(usesMaxHotKey, forKey: "usesMaxHotKey"); onHotKeyChange?() }
+    }
+    @Published var hotKeyError: String?
+    var onHotKeyChange: (() -> Void)?
     @Published var colorsTemperatures = UserDefaults.standard.object(forKey: "colorsTemperatures") as? Bool ?? true {
         didSet { defaults.set(colorsTemperatures, forKey: "colorsTemperatures"); onUpdate?() }
     }
@@ -887,6 +894,10 @@ struct SettingsView: View {
                     }
                 }
                 Toggle("Notify when fans return to Auto on their own", isOn: $model.notifiesOnReturn)
+                Toggle("⌃⌥M switches between Max and Auto", isOn: $model.usesMaxHotKey)
+                if let error = model.hotKeyError {
+                    Text(error).font(.caption).foregroundStyle(.orange)
+                }
                 if let error = model.loginItemError {
                     Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                 }
@@ -1097,7 +1108,33 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
         removeStaleSessions()
         UNUserNotificationCenter.current().delegate = self
+        model.onHotKeyChange = { [weak self] in self?.updateHotKey() }
+        updateHotKey()
         model.refresh()
+    }
+    private var hotKey: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    /// Registers or removes ⌃⌥M. Carbon hot keys need no Accessibility permission.
+    private func updateHotKey() {
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+        model.hotKeyError = nil
+        guard model.usesMaxHotKey else { return }
+        if hotKeyHandler == nil {
+            var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
+                guard let context else { return OSStatus(eventNotHandledErr) }
+                Unmanaged<MenuApp>.fromOpaque(context).takeUnretainedValue().toggleMaximum()
+                return noErr
+            }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
+        }
+        let id = EventHotKeyID(signature: 0x42414447 /* "BADG" */, id: 1)
+        let status = RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(controlKey | optionKey), id,
+                                         GetApplicationEventTarget(), 0, &hotKey)
+        if status != noErr { model.hotKeyError = "⌃⌥M is already used by another app." }
+    }
+    private func toggleMaximum() {
+        model.select(model.displayedMode == .maximum ? .auto : .maximum)
+        if model.message != nil, !popover.isShown { togglePopover() }
     }
     // Menu bar apps count as active while their popover is open; show banners anyway.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
@@ -1188,6 +1225,9 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             let entry = NSMenuItem(title: title, action: busy ? nil : #selector(selectMode(_:)), keyEquivalent: "")
             entry.target = self; entry.representedObject = mode
             entry.state = model.displayedMode == mode ? .on : .off
+            if mode == .maximum, model.usesMaxHotKey, model.hotKeyError == nil {
+                entry.keyEquivalent = "m"; entry.keyEquivalentModifierMask = [.control, .option]
+            }
             menu.addItem(entry)
         }
         menu.addItem(.separator())

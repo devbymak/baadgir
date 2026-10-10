@@ -16,6 +16,7 @@ A small, open-source macOS menu bar app for temperature monitoring and fan contr
 - Auto / Curve / Manual / Max fan modes, from the popover or the menu bar icon's right-click menu. Curve, Manual and Max stay on until you choose Auto.
 - Fan curve: four editable temperature → RPM points with a live preview. Curve mode only takes over when the curve asks for more than macOS is running, and never runs a fan below the speed macOS had chosen.
 - Optional notification when fans return to Auto on their own (safety cutoff, sensor failure, helper exit), with the reason.
+- ⌃⌥M switches between Max and Auto from any app (can be turned off in Settings).
 - Live manual-speed slider with editable, remembered minimum and maximum RPM limits.
 - One administrator prompt per session; speed and mode changes inside a session need no new prompt.
 - Automatic-control restoration attempted on Auto, quit, sleep, app crash or freeze, and monitoring failure.

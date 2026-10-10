@@ -10,7 +10,7 @@ done
 mkdir -p .build/module-cache
 baadgir_cache_path="$(cd .build/module-cache && pwd -P)"
 xcrun swift -module-cache-path "$baadgir_cache_path" sources/icon.swift .build/app-icon.iconset 'Baadgir.app/Contents/Resources/app-icon.icns'
-xcrun swiftc -target arm64-apple-macosx13.0 -module-cache-path "$baadgir_cache_path" -swift-version 5 -O -framework AppKit -framework IOKit -framework ServiceManagement -framework UserNotifications sources/policy.swift sources/main.swift -o 'Baadgir.app/Contents/MacOS/baadgir'
+xcrun swiftc -target arm64-apple-macosx13.0 -module-cache-path "$baadgir_cache_path" -swift-version 5 -O -framework AppKit -framework IOKit -framework ServiceManagement -framework UserNotifications -framework Carbon sources/policy.swift sources/main.swift -o 'Baadgir.app/Contents/MacOS/baadgir'
 cat > 'Baadgir.app/Contents/Info.plist' <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
