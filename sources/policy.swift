@@ -116,6 +116,13 @@ enum TemperatureReading: String, CaseIterable {
     }
 }
 
+/// Stacked menu bar readings: two to a column, read top to bottom, then left to right.
+enum MenuBarLayout {
+    static func columns(_ readings: [TemperatureReading]) -> [[TemperatureReading]] {
+        stride(from: 0, to: readings.count, by: 2).map { Array(readings[$0..<min($0 + 2, readings.count)]) }
+    }
+}
+
 /// Temperature → RPM points, interpolated linearly. Flat before the first and after the last point.
 struct FanCurve: Equatable {
     struct Point: Equatable {

@@ -45,7 +45,7 @@ if [[ "${1:-}" == "--install" ]]; then
   rm -rf '/Applications/Baadgir.app'
   ditto 'Baadgir.app' '/Applications/Baadgir.app'
   # Only the installed copy should handle baadgir:// links and Launch at Login.
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$PWD/Baadgir.app"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$PWD/Baadgir.app" 2>/dev/null || true  # Fails when it was never registered.
   open '/Applications/Baadgir.app'
   echo 'Installed and opened /Applications/Baadgir.app'
 fi

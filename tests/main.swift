@@ -118,6 +118,8 @@ check(TemperatureReading.ssd.value(in: withSSD) == 48 && withSSD.highest == 50, 
 rejects("Invalid SSD sensor") { _ = try Temperatures(cpu: [50], gpu: [50], ssd: [.nan]) }
 check(TemperatureReading.hottest.value(in: normal) == 60 && TemperatureReading.battery.value(in: warm) == nil,
       "Menu bar reading selection")
+check(MenuBarLayout.columns([.cpu, .gpu, .battery]) == [[.cpu, .gpu], [.battery]] &&
+      MenuBarLayout.columns([.hottest]) == [[.hottest]], "Stacked readings: two per column, odd one alone")
 func points(_ values: [(Double, Double)]) -> [FanCurve.Point] {
     values.map { FanCurve.Point(temperature: $0.0, rpm: $0.1) }
 }

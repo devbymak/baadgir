@@ -447,6 +447,14 @@ final class CoolingModel: ObservableObject {
     }() {
         didSet { defaults.set(menuBarReadings.map(\.rawValue), forKey: "menuBarReadings"); onMenuBarLayoutChange?() }
     }
+    /// Readings two to a column in a smaller font, instead of one row.
+    @Published var stacksMenuBarReadings = UserDefaults.standard.bool(forKey: "stacksMenuBarReadings") {
+        didSet { defaults.set(stacksMenuBarReadings, forKey: "stacksMenuBarReadings"); onMenuBarLayoutChange?() }
+    }
+    /// The fan symbol before the readings; filled while Baadgir controls the fans.
+    @Published var showsMenuBarIcon = UserDefaults.standard.object(forKey: "showsMenuBarIcon") as? Bool ?? true {
+        didSet { defaults.set(showsMenuBarIcon, forKey: "showsMenuBarIcon"); onMenuBarLayoutChange?() }
+    }
     var onMenuBarLayoutChange: (() -> Void)?
     func toggleMenuBar(_ reading: TemperatureReading) {
         if menuBarReadings.contains(reading) {
@@ -1012,6 +1020,13 @@ struct SettingsView: View {
                 Text("General")
             }
             Section {
+                Picker("Layout", selection: $model.stacksMenuBarReadings) {
+                    Text("Side by side").tag(false)
+                    Text("Stacked").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.menuBarReadings.count < 2)  // One reading has nothing to stack.
+                Toggle("Show the fan icon", isOn: $model.showsMenuBarIcon)
                 ForEach(TemperatureReading.allCases, id: \.self) { reading in
                     Toggle(reading.title, isOn: Binding(get: { model.menuBarReadings.contains(reading) },
                                                         set: { _ in model.toggleMenuBar(reading) }))
@@ -1211,8 +1226,6 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private var layoutPending = false
     private var symbol = "fan"
     func applicationDidFinishLaunching(_ notification: Notification) {
-        item.button?.image = NSImage(systemSymbolName: "fan", accessibilityDescription: "Baadgir")
-        item.button?.imagePosition = .imageLeading
         fixStatusItemWidth()
         item.button?.setAccessibilityLabel("Baadgir temperature and fan controls")
         item.button?.target = self; item.button?.action = #selector(statusItemClicked)
@@ -1293,16 +1306,26 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     }
     private func refreshStatusItem() {
         guard !menuOpen else { return }
-        if layoutPending { layoutPending = false; fixStatusItemWidth() } else { updateTitle() }
         let wanted = model.displayedMode == .auto ? "fan" : "fan.fill"
-        if wanted != symbol {
-            symbol = wanted
-            item.button?.image = NSImage(systemSymbolName: wanted, accessibilityDescription: "Baadgir")
+        let symbolChanged = wanted != symbol
+        symbol = wanted
+        if layoutPending { layoutPending = false; fixStatusItemWidth() }
+        else if stacked { updateStackedImage() }
+        else {
+            updateTitle()
+            if symbolChanged { item.button?.image = statusSymbol }
         }
         item.button?.toolTip = "Baadgir · " + model.status
     }
+    private var stacked: Bool { model.stacksMenuBarReadings && model.menuBarReadings.count > 1 }
+    private var statusSymbol: NSImage? {
+        model.showsMenuBarIcon ? NSImage(systemSymbolName: symbol, accessibilityDescription: "Baadgir") : nil
+    }
+    private func currentValue(_ reading: TemperatureReading) -> Double? {
+        model.temperatures.flatMap { reading.value(in: $0) }
+    }
     private var titleFont: NSFont { .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
-    /// One reading shows " 72°C"; several show " C 72°  G 64°" with letter prefixes.
+    /// One reading shows " 72°C"; several show " C 72°  G 64°" with letter prefixes. No leading space without the icon.
     private func title(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSAttributedString {
         let readings = model.menuBarReadings
         let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
@@ -1312,8 +1335,9 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         for (index, reading) in readings.enumerated() {
             if readings.count > 1 {
                 var label = base; label[.foregroundColor] = NSColor.secondaryLabelColor
-                text.append(NSAttributedString(string: (index == 0 ? " " : "  ") + reading.letter + " ", attributes: label))
-            } else { text.append(NSAttributedString(string: " ", attributes: base)) }
+                let lead = index > 0 ? "  " : model.showsMenuBarIcon ? " " : ""
+                text.append(NSAttributedString(string: lead + reading.letter + " ", attributes: label))
+            } else if model.showsMenuBarIcon { text.append(NSAttributedString(string: " ", attributes: base)) }
             var attributes = base
             if colored, let level = model.heatLevel(reading, value(reading)) {
                 attributes[.foregroundColor] = NSColor.heat(level)
@@ -1324,12 +1348,70 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         return text
     }
     private func updateTitle() {
-        item.button?.attributedTitle = title({ reading in self.model.temperatures.flatMap { reading.value(in: $0) } },
-                                             colored: true)
+        item.button?.attributedTitle = title(currentValue, colored: true)
+    }
+    private var stackedFont: NSFont { .monospacedDigitSystemFont(ofSize: 10, weight: .medium) }
+    /// The fan symbol (unless hidden), then readings two to a column: "C 72°" over "G 64°". Not a template image, so the heat colours
+    /// show; label colours resolve when the menu bar draws it, so it follows the menu bar's light or dark appearance.
+    private func stackedImage(_ value: (TemperatureReading) -> Double?, colored: Bool) -> NSImage {
+        let font = stackedFont, height = NSStatusBar.system.thickness
+        let lineHeight = ceil(font.ascender - font.descender)
+        func width(_ text: String) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
+        let letterWidth = TemperatureReading.allCases.map { width($0.letter) }.max() ?? 0
+        let gap: CGFloat = 3, spacing: CGFloat = 7
+        let column = letterWidth + gap + width("130°")  // Sized for the widest value so the item never shifts.
+        let configuration = NSImage.SymbolConfiguration(pointSize: NSFont.systemFontSize, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.labelColor]))
+        let fan = model.showsMenuBarIcon
+            ? NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(configuration) : nil
+        let fanWidth = fan.map { ceil($0.size.width) + 5 } ?? 0
+        let columns = MenuBarLayout.columns(model.menuBarReadings).map { column in
+            column.map { reading -> (letter: String, number: String, color: NSColor) in
+                let level = colored ? model.heatLevel(reading, value(reading)) : nil
+                return (reading.letter, (value(reading).map { String(Int($0.rounded())) } ?? "—") + "°",
+                        level.map(NSColor.heat) ?? .labelColor)
+            }
+        }
+        let size = NSSize(width: fanWidth + CGFloat(columns.count) * column + CGFloat(max(columns.count - 1, 0)) * spacing,
+                          height: height)
+        return NSImage(size: size, flipped: true) { _ in
+            if let fan {
+                fan.draw(in: NSRect(x: 0, y: (height - fan.size.height) / 2, width: fan.size.width, height: fan.size.height),
+                         from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            }
+            for (index, lines) in columns.enumerated() {
+                let x = fanWidth + CGFloat(index) * (column + spacing)
+                for (line, entry) in lines.enumerated() {
+                    // A column with one reading is centred vertically.
+                    let y = (height - CGFloat(lines.count) * lineHeight) / 2 + CGFloat(line) * lineHeight
+                    NSAttributedString(string: entry.letter, attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
+                        .draw(at: CGPoint(x: x, y: y))
+                    let number = NSAttributedString(string: entry.number, attributes: [.font: font, .foregroundColor: entry.color])
+                    number.draw(at: CGPoint(x: x + column - number.size().width, y: y))  // Right-aligned so digits stay put.
+                }
+            }
+            return true
+        }
+    }
+    private func updateStackedImage() {
+        item.button?.image = stackedImage(currentValue, colored: true)
+        item.button?.setAccessibilityValue(model.menuBarReadings.map { reading in
+            "\(reading.title) " + (currentValue(reading).map { "\(Int($0.rounded()))°C" } ?? "unavailable")
+        }.joined(separator: ", "))
     }
     /// Sizes the item for the widest readings so it (and the popover anchored to it) never shifts as numbers change.
     private func fixStatusItemWidth() {
         guard let button = item.button else { return }
+        if stacked {
+            button.attributedTitle = NSAttributedString()
+            button.imagePosition = .imageOnly
+            item.length = stackedImage({ _ in 130 }, colored: false).size.width + 8
+            updateStackedImage()
+            return
+        }
+        button.setAccessibilityValue(nil)
+        button.image = statusSymbol
+        button.imagePosition = model.showsMenuBarIcon ? .imageLeading : .noImage
         button.font = titleFont
         button.alignment = .center
         button.attributedTitle = title({ _ in 130 }, colored: false)
