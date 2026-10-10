@@ -378,7 +378,8 @@ func coolingSession(parent: pid_t, directory: String) throws {
                     applied = nil
                     usleep(500_000); continue
                 }
-                let desired = CoolingPolicy.curveSpeed(curve, try smc.temperatures(), thermal: thermalLevel())
+                let desired = CoolingPolicy.curveSpeed(curve, try smc.temperatures(), thermal: thermalLevel(),
+                                                       hardware: bounds)
                 wanted = curveController.targets(desired: desired, actual: try smc.fans().map { Double($0.rpm) },
                     minimums: fans.map { Double(max(1000, $0.minimum)) }, maximums: fans.map { Double($0.maximum) },
                     now: ProcessInfo.processInfo.systemUptime)?.map(Float.init)
@@ -585,6 +586,16 @@ final class CoolingModel: ObservableObject {
     @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
+    /// Shows Manual, which can hold the fans below the safe minimum. Off until turned on.
+    @Published var advanced = UserDefaults.standard.bool(forKey: "advancedMode") {
+        didSet {
+            defaults.set(advanced, forKey: "advancedMode")
+            // Turning it off ends a running Manual session rather than leaving a hidden mode in charge.
+            if !advanced, sessionRunning, mode == .manual { select(.auto) }
+        }
+    }
+    /// Manual is offered while Advanced is on, or while the fans are in it, so the current mode always shows.
+    var offersManual: Bool { advanced || displayedMode == .manual }
     /// Asks in Baadgir before a request from outside starts cooling or picks a manual speed: the mode, the manual RPM,
     /// and whether it starts a session. Nil or false declines.
     var confirmRemote: ((FanMode, Double?, Bool) -> Bool)?
@@ -599,6 +610,8 @@ final class CoolingModel: ObservableObject {
         case .curve: wanted = .curve
         case .maximum: wanted = .maximum
         case .manual(let rpm):
+            // Before the confirmation, so a request for a mode that's turned off never asks anything.
+            guard advanced else { message = Self.manualOff; onUpdate?(); return }
             if let rpm, !sliderRange.contains(rpm) {
                 message = "Choose a speed within \(Int(sliderRange.lowerBound))–\(Int(sliderRange.upperBound)) RPM."
                 onUpdate?(); return
@@ -699,8 +712,8 @@ final class CoolingModel: ObservableObject {
     func resetCurve() { if let bounds { showCurve(.standard(for: bounds)) } }
     /// What the curve asks for right now; infinity means maximum.
     var curveSpeedNow: Double? {
-        guard let curve, let temperatures else { return nil }
-        return CoolingPolicy.curveSpeed(curve, temperatures, thermal: thermalLevel())
+        guard let curve, let temperatures, let bounds else { return nil }
+        return CoolingPolicy.curveSpeed(curve, temperatures, thermal: thermalLevel(), hardware: bounds)
     }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
@@ -868,7 +881,9 @@ final class CoolingModel: ObservableObject {
         guard temperatures != nil else { return "Temperature readings are unavailable; keeping automatic cooling" }
         return nil
     }
+    private static let manualOff = "Manual is an advanced mode. Turn on Advanced in Settings › Fans to use it."
     private func manualBlocker() -> String? {
+        guard advanced else { return Self.manualOff }
         guard let bounds, let minimum, let maximum else { return "Fan limits are unavailable." }
         do {
             try SensorKeys.requireKnown(chipGeneration)
@@ -1054,7 +1069,7 @@ struct PopoverView: View {
                 Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.select($0) })) {
                     Text("Auto").tag(FanMode.auto)
                     Text("Curve").tag(FanMode.curve)
-                    Text("Manual").tag(FanMode.manual)
+                    if model.offersManual { Text("Manual").tag(FanMode.manual) }
                     Text("Max").tag(FanMode.maximum)
                 }
                 .pickerStyle(.segmented).labelsHidden()
@@ -1106,9 +1121,9 @@ struct PopoverView: View {
         case .auto where model.externallyControlled:
             return "Choose Auto to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. Curve, Manual, and Max ask for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
+            return "macOS controls the fans. \(model.advanced ? "Curve, Manual, and Max ask" : "Curve and Max ask") for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
         case .curve:
-            return "Follows your curve from Settings when it asks for more than macOS, never less. Maximum at 80°C, a hot battery or SSD, or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
+            return "Follows your curve from Settings when it asks for more than macOS, never less, and never below the safe minimum for the temperature. Maximum at 80°C, a hot battery or SSD, or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
         case .manual:
             return "Drag to change speed. Returns to Auto at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
         case .maximum:
@@ -1246,19 +1261,6 @@ struct SettingsView: View {
 
     @ViewBuilder private var fans: some View {
         Section {
-            rpmField("Minimum", text: $model.minimumText)
-            rpmField("Maximum", text: $model.maximumText)
-            if model.bounds != nil && !model.rangeIsValid {
-                warning("Enter a minimum below the maximum, within the hardware range.")
-            }
-        } header: {
-            Text("Manual Speed Limits")
-        } footer: {
-            footer(model.bounds.map { "Sets the Manual slider's range. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
-                   ?? "Reading fan limits…")
-        }
-        .disabled(model.bounds == nil)
-        Section {
             if let curve = model.curve, let bounds = model.bounds { CurvePreview(curve: curve, bounds: bounds) }
             HStack {
                 Text("Point").frame(maxWidth: .infinity, alignment: .leading)
@@ -1278,9 +1280,40 @@ struct SettingsView: View {
         } header: {
             Text("Fan Curve")
         } footer: {
-            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running (a stopped fan counts as its minimum), and never goes below macOS's speed. At 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, fans run at maximum.")
+            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running (a stopped fan counts as its minimum), and never goes below macOS's speed or the safe minimum\(model.bounds.map { " (\(Self.safeMinimumText($0)))" } ?? ""). At 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, fans run at maximum.")
         }
         .disabled(model.bounds == nil)
+        Section {
+            Toggle(isOn: $model.advanced) {
+                Text("Show Manual mode")
+                Text("Manual holds the fans at a speed you pick, which can be slower than macOS or the safe minimum would run them. It still returns to Auto at 80°C, a hot battery or SSD, or high thermal pressure.")
+            }
+        } header: {
+            Text("Advanced")
+        }
+        .disabled(model.bounds == nil)
+        if model.advanced {
+            Section {
+                rpmField("Minimum", text: $model.minimumText)
+                rpmField("Maximum", text: $model.maximumText)
+                if model.bounds != nil && !model.rangeIsValid {
+                    warning("Enter a minimum below the maximum, within the hardware range.")
+                }
+            } header: {
+                Text("Manual Speed Limits")
+            } footer: {
+                footer(model.bounds.map { "Sets the Manual slider's range. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Auto and Max ignore these limits." }
+                       ?? "Reading fan limits…")
+            }
+            .disabled(model.bounds == nil)
+        }
+    }
+    /// "2317 RPM up to 65°C, 3376 at 72°C, 4434 at 78°C" for this Mac's fans.
+    private static func safeMinimumText(_ bounds: HardwareBounds) -> String {
+        SafeMinimum.points.enumerated().map { index, point in
+            let rpm = Int(SafeMinimum.rpm(at: point.temperature, hardware: bounds)).formatted()
+            return index == 0 ? "\(rpm) RPM up to \(Int(point.temperature))°C" : "\(rpm) at \(Int(point.temperature))°C"
+        }.joined(separator: ", ")
     }
 
     @ViewBuilder private var automation: some View {
@@ -1472,7 +1505,7 @@ struct CurvePreview: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Fan curve preview")
+        .accessibilityLabel("Fan curve preview, with the safe minimum dashed")
     }
     private var graph: some View {
         GeometryReader { geometry in
@@ -1483,6 +1516,12 @@ struct CurvePreview: View {
                 path.addLine(to: point(high, bounds.maximum, in: geometry.size))
             }
             .stroke(Color.accentColor, lineWidth: 2)
+            // The safe minimum, which Curve never runs below.
+            Path { path in
+                let temperatures = [low] + SafeMinimum.points.map(\.temperature) + [high]
+                path.addLines(temperatures.map { point($0, SafeMinimum.rpm(at: $0, hardware: bounds), in: geometry.size) })
+            }
+            .stroke(Color.secondary, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
             ForEach(curve.points, id: \.temperature) { item in
                 Circle().fill(Color.accentColor).frame(width: 6, height: 6)
                     .position(point(item.temperature, item.rpm, in: geometry.size))
@@ -1782,10 +1821,9 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         if let power = model.power { info("Power: " + power.text) }
         menu.addItem(.separator())
         let busy = model.pending != nil || model.fans.isEmpty
-        for (title, mode) in model.fanless ? [] : [("Auto", FanMode.auto),
-                              ("Curve", .curve),
-                              ("Manual · \(Int(model.selectedRPM.rounded()).formatted()) RPM", .manual),
-                              ("Max", .maximum)] {
+        let modes = [("Auto", FanMode.auto), ("Curve", .curve),
+                     ("Manual · \(Int(model.selectedRPM.rounded()).formatted()) RPM", .manual), ("Max", .maximum)]
+        for (title, mode) in model.fanless ? [] : modes where mode != .manual || model.offersManual {
             let entry = NSMenuItem(title: title, action: busy ? nil : #selector(selectMode(_:)), keyEquivalent: "")
             entry.target = self; entry.representedObject = mode
             entry.state = model.displayedMode == mode ? .on : .off
@@ -1891,6 +1929,7 @@ let usage = """
 Usage: baadgir status | auto | curve | max | manual [RPM]
   status        Print fan and sensor readings (read-only).
   auto … max    Ask the running Baadgir app to change fan mode, with the same checks as the app.
+                Manual needs Advanced turned on in Settings › Fans.
 """
 let bundleIdentifier = "local.baadgir"
 /// Sends a request to the running Baadgir (launching the installed copy if needed) through its baadgir:// link.

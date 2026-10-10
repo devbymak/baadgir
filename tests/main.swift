@@ -159,16 +159,31 @@ check(CoolingTarget.curve(curve).encoded.utf8.count <= 64, "Curve target fits th
 rejects("Curve target with missing speed") { _ = try CoolingTarget(encoded: "curve 50 2000 60 3000 70 4000 78") }
 rejects("Curve target with text") { _ = try CoolingTarget(encoded: "curve 50 2000 60 3000 70 4000 78 fast") }
 let cool = try Temperatures(cpu: [55], gpu: [40])
-check(CoolingPolicy.curveSpeed(curve, cool, thermal: .nominal) == 2500, "Curve follows the hottest CPU/GPU sensor")
-check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal) == .infinity, "Curve runs maximum at the stop limit")
-check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious) == .infinity, "Curve runs maximum under thermal pressure")
-check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal) == .infinity, "Curve runs maximum with a hot battery")
-check(CoolingPolicy.curveSpeed(curve, hotSSD, thermal: .nominal) == .infinity, "Curve runs maximum with a hot SSD")
+check(CoolingPolicy.curveSpeed(curve, cool, thermal: .nominal, hardware: hardware) == 2500, "Curve follows the hottest CPU/GPU sensor")
+check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum at the stop limit")
+check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious, hardware: hardware) == .infinity, "Curve runs maximum under thermal pressure")
+check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum with a hot battery")
+check(CoolingPolicy.curveSpeed(curve, hotSSD, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum with a hot SSD")
 let oddHardware = try HardwareBounds(ranges: [(1217, 5779)])
 let oddCurve = FanCurve.standard(for: oddHardware)
-let oddSpeeds = [30.0, 55, 60, 79].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal) }
+let oddSpeeds = [30.0, 55, 60, 79].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal, hardware: oddHardware) }
 check(oddSpeeds.allSatisfy { $0 >= oddHardware.minimum && $0 <= oddHardware.maximum },
       "Rounding never takes the curve outside a hardware range that isn't a multiple of 50")
+check([50.0, 65, 72, 75, 78, 79].map { SafeMinimum.rpm(at: $0, hardware: hardware) } == [1500, 1500, 2500, 3000, 3500, 3500],
+      "Safe minimum rises from the fans' minimum at 65°C to half their range at 78°C")
+check(SafeMinimum.rpm(at: 50, hardware: oddHardware) == oddHardware.minimum, "Safe minimum starts at the fans' own minimum")
+for odd in [oddHardware, hardware] {
+    try FanCurve.standard(for: odd).validate(hardware: odd)
+    checks += 1
+}
+rejects("Curve point below the safe minimum") {
+    try FanCurve(points([(50, 2000), (60, 3000), (72, 2400), (78, 5000)])).validate(hardware: hardware)
+}
+let lowCurve = try FanCurve(points([(40, 1500), (50, 1500), (60, 1500), (70, 2300)]))
+try lowCurve.validate(hardware: hardware)
+checks += 1
+try check(CoolingPolicy.curveSpeed(lowCurve, try Temperatures(cpu: [77], gpu: [50]), thermal: .nominal, hardware: hardware)
+        == SafeMinimum.rpm(at: 77, hardware: hardware), "Curve never runs below the safe minimum past its last point")
 check(CoolingTarget.manual(rpm: 2000).isManual && !CoolingTarget.maximum.isManual && !CoolingTarget.curve(curve).isManual,
       "Only a manual target counts as already in Manual, so switching from Max or Curve uses the start limit")
 var controller = CurveController()

@@ -229,6 +229,12 @@ struct FanCurve: Equatable {
         guard points.allSatisfy({ $0.rpm >= hardware.minimum && $0.rpm <= hardware.maximum }) else {
             throw Failure("Curve speeds must be within \(Int(ceil(hardware.minimum)))–\(Int(floor(hardware.maximum))) RPM")
         }
+        for (index, point) in points.enumerated() {
+            let floor = SafeMinimum.rpm(at: point.temperature, hardware: hardware)
+            guard point.rpm >= floor else {
+                throw Failure("Point \(index + 1) needs at least \(Int(floor)) RPM at \(Int(point.temperature))°C, the safe minimum")
+            }
+        }
     }
     /// A gentle default spread across the hardware range.
     static func standard(for hardware: HardwareBounds) -> FanCurve {
@@ -242,6 +248,22 @@ struct FanCurve: Equatable {
             return a.rpm + (b.rpm - a.rpm) * (temperature - a.temperature) / (b.temperature - a.temperature)
         }
         return points.last!.rpm
+    }
+}
+
+/// The slowest Curve may run at each temperature, as a share of the fans' range: the minimum up to 65°C, a quarter
+/// of the range at 72°C, and half at 78°C. Interpolated between, flat after; from 80°C Curve runs at maximum anyway.
+/// A share of the range rather than fixed RPM, since fan ranges differ between Macs.
+enum SafeMinimum {
+    static let points: [(temperature: Double, share: Double)] = [(65, 0), (72, 0.25), (78, 0.5)]
+    static func rpm(at temperature: Double, hardware: HardwareBounds) -> Double {
+        let share: Double
+        if temperature <= points.first!.temperature { share = points.first!.share }
+        else if let (a, b) = zip(points, points.dropFirst()).first(where: { temperature <= $1.temperature }) {
+            share = a.share + (b.share - a.share) * (temperature - a.temperature) / (b.temperature - a.temperature)
+        } else { share = points.last!.share }
+        // Whole RPM, rounded up so a curve point shown as a whole number is never just under it.
+        return ceil(hardware.minimum + share * (hardware.maximum - hardware.minimum))
     }
 }
 
@@ -344,13 +366,16 @@ struct CoolingPolicy {
     static func othersBelowLimits(_ temperatures: Temperatures) -> Bool {
         (temperatures.battery.map { $0 < batteryLimit } ?? true) && (temperatures.ssd.map { $0 < ssdLimit } ?? true)
     }
-    /// Curve speed for the current readings; infinity (all fans at maximum) when it's hot.
-    static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, thermal: ThermalLevel) -> Double {
+    /// Curve speed for the current readings, never below the safe minimum; infinity (all fans at maximum) when it's hot.
+    static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, thermal: ThermalLevel,
+                           hardware: HardwareBounds) -> Double {
         guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
               othersBelowLimits(temperatures) else { return .infinity }
         // Rounding must not leave the curve's range, which is within the fans' hardware range.
         let rounded = (curve.rpm(at: temperatures.highest) / 50).rounded() * 50
-        return min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm)
+        // Checked here as well as on the curve's points: past its last point the curve stays flat while the minimum rises.
+        return max(min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm),
+                   SafeMinimum.rpm(at: temperatures.highest, hardware: hardware))
     }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
         guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,
