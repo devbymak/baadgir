@@ -427,7 +427,8 @@ enum RemoteCommand: Equatable {
         case "max", "maximum": self = .maximum
         case "manual":
             self = .manual(rpm: try rpm.map(Self.rpm))
-        default: throw Failure("Unknown Baadgir command: \(name)")
+        // Never repeat the link's text: any web page can open one, and Baadgir would show it as its own words.
+        default: throw Failure("Unknown Baadgir command")
         }
     }
     /// Parses command-line words such as `max` or `manual 3000`.
@@ -446,7 +447,7 @@ enum RemoteCommand: Equatable {
     static let rpmLimit = 20_000.0
     private static func rpm(_ text: String) throws -> Double {
         guard let value = Double(text), value.isFinite, value >= 0, value <= rpmLimit else {
-            throw Failure("Invalid RPM: \(text)")
+            throw Failure("Invalid RPM")
         }
         return value
     }

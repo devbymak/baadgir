@@ -388,8 +388,11 @@ func coolingSession(parent: pid_t, directory: String) throws {
                     changed = now
                 }
                 if wanted != applied {
+                    // Only a faster target needs time to spin up. A slower one leaves the fans above it, so the response
+                    // check keeps running while Curve ramps down or the slider moves down.
+                    if zip(wanted, applied ?? []).contains(where: { $0 > $1 }) { changed = now }
                     for (fan, rpm) in zip(fans, wanted) { try smc.target(fan, rpm: rpm) }
-                    applied = wanted; changed = now
+                    applied = wanted
                 }
             } else if applied != nil {
                 guard restore() else { throw Failure("Automatic control could not be verified. Restart your Mac.") }
@@ -484,9 +487,9 @@ func watchdog() {
     if stalled { try? restoreAutomatic(locking: false) }
 }
 let lockBusy = "A cooling session is already running"
-/// Returns fans left in manual mode (for example after a crash or by another app) to Auto.
+/// Returns fans left in manual mode (for example after a crash or by another app) to Auto. Callers check they run as root.
+/// It doesn't require the helper file itself, so the watchdog can still restore after the helper is deleted mid-session.
 func restoreAutomatic(locking: Bool = true) throws {
-    try requireRootHelper()
     let lock = locking ? try acquireLock() : -1
     defer { if lock >= 0 { close(lock) } }
     let smc = try SMC()
@@ -1560,6 +1563,10 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private var queuedCommands: [RemoteCommand] = []
     /// Handles baadgir:// links from Shortcuts, the command line, or other apps.
     func application(_ application: NSApplication, open urls: [URL]) {
+        // Checked before parsing, so a link can't open the popover with its own text while links are off.
+        guard model.allowsLinks else {
+            model.message = "Links, Shortcuts, and the command line are turned off in Settings."; showMessage(); return
+        }
         for url in urls {
             do { queuedCommands.append(try RemoteCommand(url: url)) }
             catch { model.message = String(describing: error); showMessage() }
@@ -1902,7 +1909,7 @@ if arguments.contains("--probe") || arguments.dropFirst() == ["status"] {
 } else if arguments.count == 2 && arguments[1] == "--watchdog" {
     if geteuid() == 0 { watchdog() }
 } else if arguments.count == 2 && arguments[1] == "--restore" {
-    do { try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
+    do { try requireRootHelper(); try restoreAutomatic() } catch { fputs("\(error)\n", stderr); exit(1) }
 } else if arguments.count >= 2, !arguments[1].hasPrefix("-") {
     // Plain words are commands; anything starting with "-" may come from macOS when it launches the app.
     do { exit(send(try RemoteCommand(arguments: Array(arguments.dropFirst())))) }

@@ -39,7 +39,7 @@ Works on M1 through M5 chips, using each generation's own sensor keys; a newer c
 
 `./build.sh` alone builds `Baadgir.app` here without installing it. Only one copy runs at a time; a second launch quits immediately.
 
-Fan control requires macOS administrator authorization and the helper that `--install` puts at `/Library/PrivilegedHelperTools/local.baadgir.helper`. Monitoring needs neither. To uninstall, delete the app and run `sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baadgir.lock`.
+Fan control requires macOS administrator authorization and the helper that `--install` puts at `/Library/PrivilegedHelperTools/local.baadgir.helper`. Monitoring needs neither. To uninstall, choose Auto and quit Baadgir, delete the app, and run `sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baadgir.lock`.
 
 ### Shortcuts and the command line
 
