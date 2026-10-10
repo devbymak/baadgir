@@ -539,7 +539,7 @@ final class CoolingModel: ObservableObject {
         didSet { defaults.set(stacksMenuBarReadings, forKey: "stacksMenuBarReadings"); onLayoutChange?() }
     }
     /// The fan symbol before the readings; filled while Baadgir controls the fans.
-    @Published var showsMenuBarIcon = UserDefaults.standard.object(forKey: "showsMenuBarIcon") as? Bool ?? true {
+    @Published var showsMenuBarIcon = UserDefaults.standard.object(forKey: "showsMenuBarIcon") as? Bool ?? false {
         didSet { defaults.set(showsMenuBarIcon, forKey: "showsMenuBarIcon"); onLayoutChange?() }
     }
     /// The chosen readings this Mac can show.
@@ -1123,7 +1123,7 @@ struct PopoverView: View {
         case .auto:
             return "macOS controls the fans. \(model.advanced ? "Curve, Manual, and Max ask" : "Curve and Max ask") for your administrator password once and stay on until you choose Auto. Right-click the menu bar icon for quick switching."
         case .curve:
-            return "Follows your curve from Settings when it asks for more than macOS, never less, and never below the safe minimum for the temperature. Maximum at 80°C, a hot battery or SSD, or high thermal pressure. Returns to Auto on sleep, quit, or if monitoring fails."
+            return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Returns to Auto on sleep or quit."
         case .manual:
             return "Drag to change speed. Returns to Auto at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
         case .maximum:
@@ -1280,13 +1280,13 @@ struct SettingsView: View {
         } header: {
             Text("Fan Curve")
         } footer: {
-            footer("Uses the hottest CPU or GPU reading. Curve mode only takes over when the curve wants more than macOS is running (a stopped fan counts as its minimum), and never goes below macOS's speed or the safe minimum\(model.bounds.map { " (\(Self.safeMinimumText($0)))" } ?? ""). At 80°C, a 45°C battery, a 70°C SSD, or high thermal pressure, fans run at maximum.")
+            footer("Follows the hotter of CPU and GPU. Never runs fans slower than macOS or the safe minimum (dashed line), and goes to full speed if your Mac gets too hot.")
         }
         .disabled(model.bounds == nil)
         Section {
             Toggle(isOn: $model.advanced) {
                 Text("Show Manual mode")
-                Text("Manual holds the fans at a speed you pick, which can be slower than macOS or the safe minimum would run them. It still returns to Auto at 80°C, a hot battery or SSD, or high thermal pressure.")
+                Text("Holds the fans at a speed you pick, even below the safe minimum. Returns to Auto if your Mac gets too hot.")
             }
         } header: {
             Text("Advanced")
@@ -1307,13 +1307,6 @@ struct SettingsView: View {
             }
             .disabled(model.bounds == nil)
         }
-    }
-    /// "2317 RPM up to 65°C, 3376 at 72°C, 4434 at 78°C" for this Mac's fans.
-    private static func safeMinimumText(_ bounds: HardwareBounds) -> String {
-        SafeMinimum.points.enumerated().map { index, point in
-            let rpm = Int(SafeMinimum.rpm(at: point.temperature, hardware: bounds)).formatted()
-            return index == 0 ? "\(rpm) RPM up to \(Int(point.temperature))°C" : "\(rpm) at \(Int(point.temperature))°C"
-        }.joined(separator: ", ")
     }
 
     @ViewBuilder private var automation: some View {
