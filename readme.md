@@ -1,5 +1,7 @@
 # Parvanak
 
+<img src="assets/app-icon.png" width="96" alt="Parvanak icon">
+
 A small, open-source macOS menu bar app for monitoring fans and requesting a short cooling boost. Built with Swift and AppKit, with no third-party dependencies.
 
 ## Features
