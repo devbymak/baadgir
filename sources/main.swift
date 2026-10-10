@@ -1191,65 +1191,176 @@ struct Sparkline: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         var drawing = false
-        let span = max(range.upperBound - range.lowerBound, 1)
-        // Newest sample at the right edge, so a fresh history grows in from the right.
-        let offset = capacity - values.count
         for (index, value) in values.enumerated() {
             guard let value else { drawing = false; continue }
-            let clamped = min(max(value, range.lowerBound), range.upperBound)
-            let point = CGPoint(x: rect.minX + rect.width * CGFloat(index + offset) / CGFloat(max(capacity - 1, 1)),
-                                y: rect.maxY - rect.height * CGFloat((clamped - range.lowerBound) / span))
+            let point = Self.point(index, of: values.count, value: value, range: range, capacity: capacity, in: rect)
             if drawing { path.addLine(to: point) } else { path.move(to: point); drawing = true }
         }
         return path
     }
+    /// Newest sample at the right edge, so a fresh history grows in from the right.
+    static func x(_ index: Int, of count: Int, capacity: Int, in rect: CGRect) -> CGFloat {
+        rect.minX + rect.width * CGFloat(index + capacity - count) / CGFloat(max(capacity - 1, 1))
+    }
+    static func y(_ value: Double, range: ClosedRange<Double>, in rect: CGRect) -> CGFloat {
+        let clamped = min(max(value, range.lowerBound), range.upperBound)
+        return rect.maxY - rect.height * CGFloat((clamped - range.lowerBound) / max(range.upperBound - range.lowerBound, 1))
+    }
+    static func point(_ index: Int, of count: Int, value: Double, range: ClosedRange<Double>, capacity: Int, in rect: CGRect) -> CGPoint {
+        CGPoint(x: x(index, of: count, capacity: capacity, in: rect), y: y(value, range: range, in: rect))
+    }
 }
 
-/// Ten-minute CPU/GPU temperature and fan speed graphs.
+/// One line per series over the last 10 minutes, with gridlines, value labels on the right and a crosshair on hover.
+struct HistoryChart: View {
+    struct Series { let values: [Double?]; let color: Color }
+    let series: [Series]
+    let scale: (range: ClosedRange<Double>, ticks: [Double])
+    let label: (Double) -> String
+    let capacity: Int
+    let height: CGFloat
+    /// Sample under the pointer, shared by the charts so they move together.
+    @Binding var hovered: Int?
+    static let axisWidth: CGFloat = 30
+    private let inset: CGFloat = 6  // Room for the top and bottom labels.
+    var body: some View {
+        GeometryReader { geometry in
+            let plot = CGRect(x: 0, y: inset, width: geometry.size.width - Self.axisWidth, height: geometry.size.height - 2 * inset)
+            let count = series.first?.values.count ?? 0
+            ZStack(alignment: .topLeading) {
+                Path { path in
+                    for tick in scale.ticks {
+                        let y = Sparkline.y(tick, range: scale.range, in: plot)
+                        path.move(to: CGPoint(x: plot.minX, y: y)); path.addLine(to: CGPoint(x: plot.maxX, y: y))
+                    }
+                    // Five minutes ago.
+                    path.move(to: CGPoint(x: plot.midX, y: plot.minY)); path.addLine(to: CGPoint(x: plot.midX, y: plot.maxY))
+                }
+                .stroke(.quaternary, lineWidth: 1)
+                ForEach(series.indices, id: \.self) { index in
+                    Sparkline(values: series[index].values, range: scale.range, capacity: capacity)
+                        .stroke(series[index].color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                        .frame(width: plot.width, height: plot.height).offset(y: plot.minY)
+                }
+                if let hovered, hovered < count {
+                    let x = Sparkline.x(hovered, of: count, capacity: capacity, in: plot)
+                    Path { path in path.move(to: CGPoint(x: x, y: plot.minY)); path.addLine(to: CGPoint(x: x, y: plot.maxY)) }
+                        .stroke(.secondary, lineWidth: 1)
+                    ForEach(series.indices, id: \.self) { index in
+                        if let value = series[index].values[hovered] {
+                            Circle().fill(series[index].color).frame(width: 7, height: 7)
+                                .background(Circle().fill(Color(nsColor: .windowBackgroundColor)).padding(-1.5))
+                                .position(x: x, y: Sparkline.y(value, range: scale.range, in: plot))
+                        }
+                    }
+                }
+                ForEach(scale.ticks, id: \.self) { tick in
+                    Text(label(tick)).font(.system(size: 9)).monospacedDigit().foregroundStyle(.secondary)
+                        .frame(width: Self.axisWidth - 6, alignment: .leading)
+                        .position(x: plot.maxX + Self.axisWidth / 2 + 3, y: Sparkline.y(tick, range: scale.range, in: plot))
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                guard case .active(let location) = phase, count > 0, location.x <= plot.maxX else { hovered = nil; return }
+                let position = Int((location.x / plot.width * CGFloat(capacity - 1)).rounded()) - (capacity - count)
+                hovered = min(max(position, 0), count - 1)
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+/// Ten-minute CPU/GPU temperature and fan speed charts.
 struct HistoryView: View {
     let samples: [HistorySample]
     let fanMaximum: Double?
     var showsFan = true
     private let capacity = 600
+    @StateObject private var pointer = Pointer()
+    /// Sample under the pointer. An object rather than `@State`, whose macro plugin plain swiftc builds cannot load.
+    final class Pointer: ObservableObject { @Published var hovered: Int? }
     var body: some View {
+        let hovered = pointer.hovered
         let temperatures = samples.flatMap { [$0.cpu, $0.gpu] }.compactMap { $0 }
-        let temperatureRange = 30...max(90, (temperatures.max() ?? 0) + 5)
         let fanPeak = samples.compactMap(\.fan).max()
+        // Values under the pointer, or the newest ones.
+        let shown = hovered.flatMap { samples.indices.contains($0) ? samples[$0] : nil } ?? samples.last
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Last 10 minutes").foregroundStyle(.secondary)
+                Text("Last 10 minutes").font(.caption.weight(.medium))
                 Spacer()
-                legend("CPU", .orange); legend("GPU", .purple)
-                if let peak = temperatures.max() { Text("peak \(Int(peak.rounded()))°C").foregroundStyle(.secondary) }
+                if let hovered, hovered < samples.count {
+                    Text(Self.ago(seconds: samples.count - 1 - hovered)).monospacedDigit().foregroundStyle(.secondary)
+                }
             }
             .font(.caption)
-            ZStack {
-                Sparkline(values: samples.map(\.cpu), range: temperatureRange, capacity: capacity).stroke(.orange, lineWidth: 1.5)
-                Sparkline(values: samples.map(\.gpu), range: temperatureRange, capacity: capacity).stroke(.purple, lineWidth: 1.5)
+            HStack(spacing: 10) {
+                legend("CPU", .orange, shown?.cpu.map(Self.degrees))
+                legend("GPU", .purple, shown?.gpu.map(Self.degrees))
+                Spacer()
+                if let peak = temperatures.max() { Text("peak \(Self.degrees(peak))").foregroundStyle(.secondary) }
             }
-            .frame(height: 36)
-            .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
+            .font(.caption)
+            HistoryChart(series: [.init(values: samples.map(\.cpu), color: .orange), .init(values: samples.map(\.gpu), color: .purple)],
+                         scale: Self.temperatureScale(temperatures), label: Self.degrees, capacity: capacity, height: 88, hovered: $pointer.hovered)
             if showsFan {
-                HStack {
-                    legend("Fan", .teal)
+                HStack(spacing: 10) {
+                    legend("Fan", .teal, shown?.fan.map { "\(Int($0.rounded()).formatted()) RPM" })
                     Spacer()
                     if let fanPeak { Text("peak \(Int(fanPeak.rounded()).formatted()) RPM").foregroundStyle(.secondary) }
                 }
                 .font(.caption)
-                Sparkline(values: samples.map(\.fan), range: 0...(fanMaximum ?? max(fanPeak ?? 1, 1)), capacity: capacity)
-                    .stroke(.teal, lineWidth: 1.5)
-                    .frame(height: 24)
-                    .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
+                .padding(.top, 4)
+                HistoryChart(series: [.init(values: samples.map(\.fan), color: .teal)],
+                             scale: Self.fanScale(maximum: fanMaximum ?? max(fanPeak ?? 1, 1)), label: Self.rpm,
+                             capacity: capacity, height: 56, hovered: $pointer.hovered)
             }
+            ZStack {
+                Text("10 min ago").frame(maxWidth: .infinity, alignment: .leading)
+                Text("5 min").frame(maxWidth: .infinity, alignment: .center)
+                Text("now").frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .font(.system(size: 9)).foregroundStyle(.secondary)
+            .padding(.trailing, HistoryChart.axisWidth)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(showsFan ? "Temperature and fan history for the last 10 minutes" : "Temperature history for the last 10 minutes")
+        .accessibilityValue(summary(temperaturePeak: temperatures.max(), fanPeak: showsFan ? fanPeak : nil))
     }
-    private func legend(_ title: String, _ color: Color) -> some View {
-        HStack(spacing: 3) {
-            Circle().fill(color).frame(width: 6, height: 6)
+    private func summary(temperaturePeak: Double?, fanPeak: Double?) -> String {
+        var parts: [String] = []
+        if let temperaturePeak { parts.append("Peak temperature \(Self.degrees(temperaturePeak))") }
+        if let fanPeak { parts.append("peak fan speed \(Int(fanPeak.rounded()).formatted()) RPM") }
+        return parts.joined(separator: ", ")
+    }
+    private func legend(_ title: String, _ color: Color, _ value: String?) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 7, height: 7)
             Text(title).foregroundStyle(.secondary)
+            Text(value ?? "—").monospacedDigit()
         }
+    }
+    static func degrees(_ value: Double) -> String { "\(Int(value.rounded()))°" }
+    static func rpm(_ value: Double) -> String {
+        value < 1000 ? "\(Int(value))" : "\((value / 1000).formatted(.number.precision(.fractionLength(0...1))))k"
+    }
+    static func ago(seconds: Int) -> String {
+        seconds < 60 ? "\(seconds)s ago" : "\(seconds / 60)m \(String(format: "%02d", seconds % 60))s ago"
+    }
+    /// Fits the readings with some headroom, in steps of 10°C (20°C for a wide spread), at least two steps tall.
+    static func temperatureScale(_ values: [Double]) -> (range: ClosedRange<Double>, ticks: [Double]) {
+        guard let low = values.min(), let high = values.max() else { return (40...60, [40, 50, 60]) }
+        let step: Double = high - low > 30 ? 20 : 10
+        let lower = ((low - 2) / step).rounded(.down) * step
+        let upper = max(((high + 2) / step).rounded(.up) * step, lower + 2 * step)
+        return (lower...upper, Array(stride(from: lower, through: upper, by: step)))
+    }
+    /// Zero to the fans' maximum, rounded up to at most two even steps.
+    static func fanScale(maximum: Double) -> (range: ClosedRange<Double>, ticks: [Double]) {
+        let step = [500.0, 1000, 1500, 2000, 2500, 3000, 4000, 5000].first { (maximum / $0).rounded(.up) <= 2 } ?? (maximum / 2).rounded(.up)
+        let upper = (maximum / step).rounded(.up) * step
+        return (0...upper, Array(stride(from: 0, through: upper, by: step)))
     }
 }
 
