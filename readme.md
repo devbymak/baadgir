@@ -59,7 +59,7 @@ This builds the app, installs a small root-owned fan-control helper, and copies 
 
 Turn on Settings → Automation → Shortcuts, links, and command line first. It's off by default because any app or web page can open a link. Baadgir still asks for confirmation before it starts cooling or sets a fixed speed.
 
-- **Shortcuts:** add an *Open URLs* action with `baadgir://off`, `baadgir://curve`, `baadgir://max` or `baadgir://fixed?rpm=3000`. The older `auto` and `manual` names still work.
+- **Shortcuts:** add an *Open URLs* action with `baadgir://off`, `baadgir://curve`, `baadgir://max` or `baadgir://fixed?rpm=3000`.
 - **Terminal:**
 
   ```sh

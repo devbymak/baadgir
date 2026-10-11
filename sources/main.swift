@@ -2207,7 +2207,6 @@ let usage = """
 Usage: baadgir status | off | curve | fixed [RPM] | max
   status        Print fan and sensor readings (read-only).
   off … max     Ask the running Baadgir app to change fan mode, with the same checks as the app.
-                auto and manual still work.
 """
 let bundleIdentifier = "local.baadgir"
 /// Sends a request to the running Baadgir (launching the installed copy if needed) through its baadgir:// link.
@@ -2236,7 +2235,7 @@ if arguments.dropFirst() == ["--probe"] || arguments.dropFirst() == ["status"] {
     // Plain words are commands; anything starting with "-" may come from macOS when it launches the app.
     do { exit(send(try RemoteCommand(arguments: Array(arguments.dropFirst())))) }
     catch {
-        if ["fixed", "manual"].contains(arguments[1].lowercased()) { fputs("\(error)\n", stderr) }
+        if arguments[1].lowercased() == "fixed" { fputs("\(error)\n", stderr) }
         fputs(usage + "\n", stderr); exit(arguments[1] == "help" ? 0 : 2)
     }
 } else if geteuid() == 0 {

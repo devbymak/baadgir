@@ -508,13 +508,10 @@ enum RemoteCommand: Equatable {
         }
         let rpm = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "rpm" }?.value
         switch name {
-        case "auto": self = .auto
+        case "off": self = .auto
         case "curve": self = .curve
         case "max", "maximum": self = .maximum
-        // Off and Fixed are the names the app shows; auto and manual still work for existing Shortcuts and scripts.
-        case "off": self = .auto
-        case "fixed", "manual":
-            self = .manual(rpm: try rpm.map(Self.rpm))
+        case "fixed": self = .manual(rpm: try rpm.map(Self.rpm))
         // Never repeat the link's text: any web page can open one, and Baadgir would show it as its own words.
         default: throw Failure("Unknown Baadgir command")
         }
@@ -522,11 +519,11 @@ enum RemoteCommand: Equatable {
     /// Parses command-line words such as `max` or `fixed 3000`.
     init(arguments: [String]) throws {
         switch arguments.map({ $0.lowercased() }) {
-        case ["off"], ["auto"]: self = .auto
+        case ["off"]: self = .auto
         case ["curve"]: self = .curve
         case ["max"], ["maximum"]: self = .maximum
-        case ["fixed"], ["manual"]: self = .manual(rpm: nil)
-        case let words where words.count == 2 && ["fixed", "manual"].contains(words[0]):
+        case ["fixed"]: self = .manual(rpm: nil)
+        case let words where words.count == 2 && words[0] == "fixed":
             self = .manual(rpm: try Self.rpm(words[1]))
         default: throw Failure("Unknown command")
         }

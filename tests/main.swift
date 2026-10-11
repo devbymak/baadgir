@@ -274,24 +274,23 @@ check(plugged.text == "25.8 W · adapter 28.3 W", "Power text with adapter")
 try check(try PowerReadings(system: 9, adapter: 0.1).adapter == nil, "Ignore adapter trickle when unplugged")
 rejects("Invalid power reading") { _ = try PowerReadings(system: .nan, adapter: nil) }
 rejects("Implausible power reading") { _ = try PowerReadings(system: 900, adapter: nil) }
-for (text, command) in [("baadgir://auto", RemoteCommand.auto), ("baadgir://curve", .curve), ("BAADGIR://Max", .maximum),
-                        ("baadgir://maximum", .maximum), ("baadgir://manual", .manual(rpm: nil)),
-                        ("baadgir://manual?rpm=3000", .manual(rpm: 3000)), ("baadgir://off", .auto),
-                        ("baadgir://fixed", .manual(rpm: nil)), ("baadgir://fixed?rpm=2500", .manual(rpm: 2500))] {
+for (text, command) in [("baadgir://off", RemoteCommand.auto), ("baadgir://curve", .curve), ("BAADGIR://Max", .maximum),
+                        ("baadgir://maximum", .maximum), ("baadgir://fixed", .manual(rpm: nil)),
+                        ("baadgir://fixed?rpm=2500", .manual(rpm: 2500))] {
     try check(try RemoteCommand(url: URL(string: text)!) == command, "Link \(text)")
     try check(try RemoteCommand(url: command.url) == command, "Link round trip \(text)")
 }
-for text in ["https://max", "baadgir://stop", "baadgir://manual?rpm=fast", "baadgir://manual?rpm=nan", "baadgir:max",
-             "baadgir://manual?rpm=1e20", "baadgir://manual?rpm=-1"] {
+for text in ["https://max", "baadgir://stop", "baadgir://fixed?rpm=fast", "baadgir://fixed?rpm=nan", "baadgir:max",
+             "baadgir://fixed?rpm=1e20", "baadgir://fixed?rpm=-1", "baadgir://auto", "baadgir://manual"] {
     rejects("Bad link \(text)") { _ = try RemoteCommand(url: URL(string: text)!) }
 }
-try check(try RemoteCommand(arguments: ["manual", "2500"]) == .manual(rpm: 2500), "Command-line manual speed")
 try check(try RemoteCommand(arguments: ["fixed", "2500"]) == .manual(rpm: 2500) && RemoteCommand(arguments: ["off"]) == .auto,
           "Command-line Off and Fixed, the names the app shows")
 try check(try RemoteCommand(arguments: ["MAX"]) == .maximum, "Command-line words ignore case")
-try check(try RemoteCommand(url: RemoteCommand(arguments: ["manual", "20000"]).url) == .manual(rpm: 20000),
+try check(try RemoteCommand(url: RemoteCommand(arguments: ["fixed", "20000"]).url) == .manual(rpm: 20000),
           "The largest accepted speed still forms a link")
-for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["stop"], ["manual", "1e20"], ["manual", "inf"]] {
+for words in [[], ["status", "x"], ["fixed", "fast"], ["fixed", "1", "2"], ["stop"], ["fixed", "1e20"], ["fixed", "inf"],
+              ["auto"], ["manual"], ["manual", "2500"]] {
     rejects("Bad command \(words)") { _ = try RemoteCommand(arguments: words) }
 }
 var rules = PowerRules()
