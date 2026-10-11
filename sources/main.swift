@@ -634,7 +634,6 @@ final class CoolingModel: ObservableObject {
     @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
-    /// Shows Manual, which can hold the fans below the safe minimum. Off until turned on.
     /// Asks in Baadgir before a request from outside starts cooling or picks a manual speed: the mode, the manual RPM,
     /// and whether it starts a session. Nil or false declines.
     var confirmRemote: ((FanMode, Double?, Bool) -> Bool)?
@@ -667,7 +666,9 @@ final class CoolingModel: ObservableObject {
     }
     @Published var rules = PowerRules(
         autoOnBattery: UserDefaults.standard.bool(forKey: "autoOnBattery"),
-        onAdapter: UserDefaults.standard.string(forKey: "onAdapterMode").flatMap(FanMode.init(rawValue:))) {
+        // Only the modes Settings offers: anything else in the saved preferences would start without a click.
+        onAdapter: UserDefaults.standard.string(forKey: "onAdapterMode").flatMap(FanMode.init(rawValue:))
+            .flatMap { [.curve, .maximum].contains($0) ? $0 : nil }) {
         didSet {
             defaults.set(rules.autoOnBattery, forKey: "autoOnBattery")
             defaults.set(rules.onAdapter?.rawValue, forKey: "onAdapterMode")
