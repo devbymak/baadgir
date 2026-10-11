@@ -400,9 +400,11 @@ func coolingSession(parent: pid_t, directory: String) throws {
                 wanted = fans.map(\.maximum)
             case .manual(let rpm):
                 // Switching into Manual from Max or Curve must meet the same start limit as a new session.
-                try CoolingPolicy.validateTemperature(smc.temperatures(), thermal: thermalLevel(),
-                                                      starting: !wasManual)
-                wanted = fans.map { _ in Float(rpm) }
+                let temperatures = try smc.temperatures()
+                try CoolingPolicy.validateTemperature(temperatures, thermal: thermalLevel(), starting: !wasManual)
+                // Never below the safe minimum, whatever the app or anything else running as the user asks for.
+                let speed = Float(CoolingPolicy.fixedSpeed(rpm, temperatures, hardware: bounds))
+                wanted = fans.map { _ in speed }
             case .curve(let curve):
                 if !curveController.engaged, applied != nil {
                     // Coming from Manual or Max: hand the fans back so the curve starts from macOS's own speed.
@@ -780,6 +782,11 @@ final class CoolingModel: ObservableObject {
         guard let curve, let temperatures, let bounds else { return nil }
         return CoolingPolicy.curveSpeed(curve, temperatures, following: steady.value, thermal: thermalLevel(), hardware: bounds)
     }
+    /// The speed Fixed holds right now, as the helper works it out: the chosen speed, or the safe minimum when higher.
+    var fixedSpeedNow: Double {
+        guard let temperatures, let bounds else { return selectedRPM.rounded() }
+        return CoolingPolicy.fixedSpeed(selectedRPM.rounded(), temperatures, hardware: bounds)
+    }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
     private let queue = DispatchQueue(label: "local.baadgir.sensors")
@@ -820,7 +827,7 @@ final class CoolingModel: ObservableObject {
             guard let fan = fans.first(where: { $0.mode == 1 }) else { return "Curve · following macOS" }
             return "Curve · \(Int(fan.rpm.rounded()).formatted()) RPM"
         }
-        return "Fixed · \(Int(selectedRPM.rounded()).formatted()) RPM"
+        return "Fixed · \(Int(fixedSpeedNow).formatted()) RPM"
     }
     var thermalText: String {
         switch thermalLevel() {
@@ -1233,6 +1240,10 @@ struct PopoverView: View {
         }
         .disabled(model.bounds == nil || !model.rangeIsValid)
         .accessibilityLabel("Fixed fan speed in RPM")
+        if model.fixedSpeedNow > model.selectedRPM.rounded() {
+            Text("Running at \(Int(model.fixedSpeedNow).formatted()) RPM, the safe minimum at \(Int((model.temperatures?.highest ?? 0).rounded()))°C")
+                .font(.caption).monospacedDigit()
+        }
         if model.bounds != nil && !model.rangeIsValid {
             Text("Fix the speed limits in Settings.").font(.caption).foregroundStyle(.orange)
         } else {
@@ -1249,7 +1260,7 @@ struct PopoverView: View {
         case .curve:
             return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Hands the fans back to macOS on sleep or quit."
         case .manual:
-            return "Drag to change speed. Hands the fans back to macOS at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
+            return "Drag to change speed. Never runs below the safe minimum when hot, and hands the fans back to macOS at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
         case .maximum:
             return "Fans run at full speed until you choose another mode, sleep, or quit."
         }
@@ -1427,7 +1438,7 @@ struct SettingsView: View {
         } header: {
             Text("Fixed Speed Limits")
         } footer: {
-            footer(model.bounds.map { "Sets the Fixed slider's range. Fixed can run below Curve's safe minimum, and hands the fans back to macOS if your Mac gets too hot. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Curve and Max ignore these limits." }
+            footer(model.bounds.map { "Sets the Fixed slider's range. Like Curve, Fixed never runs below the safe minimum (dashed line), and hands the fans back to macOS if your Mac gets too hot. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Curve and Max ignore these limits." }
                    ?? "Reading fan limits…")
         }
         .disabled(model.bounds == nil)

@@ -177,6 +177,18 @@ check(oddSpeeds.allSatisfy { $0 >= oddHardware.minimum && $0 <= oddHardware.maxi
 check([50.0, 65, 72, 75, 78, 79].map { SafeMinimum.rpm(at: $0, hardware: hardware) } == [1500, 1500, 2500, 3000, 3500, 3500],
       "Safe minimum rises from the fans' minimum at 65°C to half their range at 78°C")
 check(SafeMinimum.rpm(at: 50, hardware: oddHardware) == oddHardware.minimum, "Safe minimum starts at the fans' own minimum")
+try check(CoolingPolicy.fixedSpeed(1500, try Temperatures(cpu: [60], gpu: [50]), hardware: hardware) == 1500,
+          "Fixed keeps the chosen speed while cool")
+try check(CoolingPolicy.fixedSpeed(1500, try Temperatures(cpu: [50], gpu: [78]), hardware: hardware) == 3500,
+          "Fixed never runs below the safe minimum of the hottest CPU/GPU sensor")
+try check(CoolingPolicy.fixedSpeed(4000, try Temperatures(cpu: [78], gpu: [50]), hardware: hardware) == 4000,
+          "Fixed keeps a chosen speed above the safe minimum")
+try check(CoolingPolicy.fixedSpeed(1500, try Temperatures(cpu: [70], gpu: [50]), hardware: hardware)
+          .truncatingRemainder(dividingBy: 50) == 0, "Fixed rounds the safe minimum to 50 RPM so small changes don't rewrite the target")
+try check([60.0, 70, 74, 78, 79].allSatisfy { temperature in
+    let speed = CoolingPolicy.fixedSpeed(oddHardware.minimum, try Temperatures(cpu: [temperature], gpu: [40]), hardware: oddHardware)
+    return speed >= SafeMinimum.rpm(at: temperature, hardware: oddHardware) && speed <= oddHardware.maximum
+}, "Fixed stays between the safe minimum and the fans' maximum, even with odd fan ranges")
 for odd in [oddHardware, hardware] {
     for preset in CurvePreset.allCases {
         try preset.curve(for: odd).validate(hardware: odd)

@@ -432,6 +432,12 @@ struct CoolingPolicy {
         return max(min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm),
                    SafeMinimum.rpm(at: temperatures.highest, hardware: hardware))
     }
+    /// Fixed speed for the current readings: the chosen RPM, raised to the safe minimum when it's warm, so Fixed gets
+    /// the same margin as Curve. Rounded up to 50 RPM so small temperature changes don't rewrite the target every update.
+    static func fixedSpeed(_ rpm: Double, _ temperatures: Temperatures, hardware: HardwareBounds) -> Double {
+        let floor = SafeMinimum.rpm(at: temperatures.highest, hardware: hardware)
+        return max(rpm, min((floor / 50).rounded(.up) * 50, hardware.maximum))
+    }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
         guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,
               maximum <= hardware.maximum, minimum < maximum else {
