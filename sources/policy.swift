@@ -339,10 +339,14 @@ struct CurveController {
     static let releaseDelay = 10.0
     /// Largest speed drop per update, so falling temperatures don't make fans hunt.
     static let rampDown = 100.0
+    /// How far the curve must fall below the applied speed before the fans start slowing, so small wobbles in the
+    /// steadied temperature don't make them hunt. Once started, the ramp goes all the way down.
+    static let holdMargin = 150.0
     /// macOS's per-fan speeds when Baadgir took over; nil while macOS controls the fans.
     private(set) var floors: [Double]?
     private(set) var applied: [Double]?
     private var belowSince: Double?
+    private var rampingDown = false
     var engaged: Bool { floors != nil }
     /// Per-fan targets, or nil to leave the fans with macOS. `now` is monotonic seconds.
     mutating func targets(desired: Double, actual: [Double], minimums: [Double], maximums: [Double], now: Double) -> [Double]? {
@@ -361,8 +365,30 @@ struct CurveController {
             }
         } else { belowSince = nil }
         let wanted = zip(floors, maximums).map { min(max(desired, $0), $1) }
-        self.applied = zip(wanted, applied).map { $0 >= $1 ? $0 : max($0, $1 - Self.rampDown) }
-        return self.applied
+        if zip(wanted, applied).contains(where: { $1 - $0 >= Self.holdMargin }) { rampingDown = true }
+        // Faster applies at once; slower only while ramping, otherwise the fans hold their speed.
+        let next = zip(wanted, applied).map { $0 >= $1 ? $0 : rampingDown ? max($0, $1 - Self.rampDown) : $1 }
+        if zip(next, wanted).allSatisfy({ $0 <= $1 }) { rampingDown = false }
+        self.applied = next
+        return next
+    }
+}
+
+/// The temperature Curve follows: the hottest CPU/GPU reading, steadied so brief spikes don't make the fans hunt. It
+/// follows a rise within seconds and a fall more slowly, so it errs toward cooling. Only the curve and its safe minimum
+/// use it: the stop limit, thermal pressure and the battery and SSD cutoffs still act on the raw readings.
+struct SteadyTemperature {
+    /// Time constants in seconds: about two thirds of a step is followed in this time.
+    static let riseTime = 6.0, fallTime = 20.0
+    private(set) var value: Double?
+    private var time = 0.0
+    /// `now` is monotonic seconds.
+    mutating func update(_ reading: Double, now: Double) -> Double {
+        guard let value, value.isFinite else { self.value = reading; time = now; return reading }
+        let constant = reading > value ? Self.riseTime : Self.fallTime
+        let next = value + (reading - value) * (1 - exp(-max(0, now - time) / constant))
+        self.value = next; time = now
+        return next
     }
 }
 
@@ -393,15 +419,17 @@ struct CoolingPolicy {
         (temperatures.battery.map { $0 < batteryLimit } ?? true) && (temperatures.ssd.map { $0 < ssdLimit } ?? true)
     }
     /// Curve speed for the current readings, never below the safe minimum; infinity (all fans at maximum) when it's hot.
-    static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, thermal: ThermalLevel,
-                           hardware: HardwareBounds) -> Double {
+    /// `following` is the steadied temperature the curve looks up; the cutoffs always use the raw readings.
+    static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, following: Double? = nil,
+                           thermal: ThermalLevel, hardware: HardwareBounds) -> Double {
         guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
               othersBelowLimits(temperatures) else { return .infinity }
+        let followed = following ?? temperatures.highest
         // Rounding must not leave the curve's range, which is within the fans' hardware range.
-        let rounded = (curve.rpm(at: temperatures.highest) / 50).rounded() * 50
+        let rounded = (curve.rpm(at: followed) / 50).rounded() * 50
         // Checked here as well as on the curve's points: past its last point the curve stays flat while the minimum rises.
         return max(min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm),
-                   SafeMinimum.rpm(at: temperatures.highest, hardware: hardware))
+                   SafeMinimum.rpm(at: followed, hardware: hardware))
     }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
         guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,

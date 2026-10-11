@@ -375,6 +375,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
         return true
     }
     var curveController = CurveController()
+    var steady = SteadyTemperature()
     do {
         guard !cancelled() else { throw Failure("Cooling session was cancelled") }
         let clock = ContinuousClock()
@@ -405,13 +406,15 @@ func coolingSession(parent: pid_t, directory: String) throws {
                     applied = nil
                     usleep(500_000); continue
                 }
-                let desired = CoolingPolicy.curveSpeed(curve, try smc.temperatures(), thermal: thermalLevel(),
+                let temperatures = try smc.temperatures()
+                let followed = steady.update(temperatures.highest, now: ProcessInfo.processInfo.systemUptime)
+                let desired = CoolingPolicy.curveSpeed(curve, temperatures, following: followed, thermal: thermalLevel(),
                                                        hardware: bounds)
                 wanted = curveController.targets(desired: desired, actual: try smc.fans().map { Double($0.rpm) },
                     minimums: fans.map { Double(max(1000, $0.minimum)) }, maximums: fans.map { Double($0.maximum) },
                     now: ProcessInfo.processInfo.systemUptime)?.map(Float.init)
             }
-            if case .curve = target {} else { curveController = CurveController() }
+            if case .curve = target {} else { curveController = CurveController(); steady = SteadyTemperature() }
             if let wanted {
                 if applied == nil {
                     // Manual and Max start at maximum, never a stale low target; Curve starts above macOS's speed.
@@ -771,10 +774,13 @@ final class CoolingModel: ObservableObject {
         guard let moved = try? FanCurve(points), moved != curve else { return }
         showCurve(moved)
     }
+    /// The steadied temperature the curve follows, tracked like the helper does.
+    private var steady = SteadyTemperature()
+    var curveTemperature: Double? { temperatures == nil ? nil : steady.value }
     /// What the curve asks for right now; infinity means maximum.
     var curveSpeedNow: Double? {
         guard let curve, let temperatures, let bounds else { return nil }
-        return CoolingPolicy.curveSpeed(curve, temperatures, thermal: thermalLevel(), hardware: bounds)
+        return CoolingPolicy.curveSpeed(curve, temperatures, following: steady.value, thermal: thermalLevel(), hardware: bounds)
     }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
@@ -882,6 +888,7 @@ final class CoolingModel: ObservableObject {
             let errorMessage = errors.joined(separator: "\n")
             DispatchQueue.main.async {
                 self.reading = false
+                if let temperatures { _ = self.steady.update(temperatures.highest, now: ProcessInfo.processInfo.systemUptime) }
                 self.fans = fans; self.temperatures = temperatures; self.power = power; self.sensorError = errorMessage
                 if let fanless { self.fanless = fanless }
                 self.hasRead = true
@@ -1176,7 +1183,7 @@ struct PopoverView: View {
                 if model.showsManualControls { manualControls }
                 if model.sessionRunning && model.mode == .curve, let speed = model.curveSpeedNow {
                     Text(speed.isInfinite ? "Curve wants maximum cooling"
-                                          : "Curve wants \(Int(speed).formatted()) RPM at \(Int(model.temperatures?.highest ?? 0))°C")
+                                          : "Curve wants \(Int(speed).formatted()) RPM at \(Int((model.curveTemperature ?? 0).rounded()))°C, smoothed")
                         .font(.caption).monospacedDigit()
                 }
                 if model.displayedMode == .curve, let curve = model.curve, let bounds = model.bounds {
@@ -1662,12 +1669,25 @@ struct CurveEditor: View {
                 .position(x: geometry.size.width / 2, y: geometry.size.height)
         }
     }
-    /// Where a point's value goes: above and left of it, which a rising curve leaves clear, or just left of it when
-    /// the point is too close to the top. Kept inside the chart sideways.
-    private func valuePosition(_ at: CGPoint, in size: CGSize) -> CGPoint {
-        let halfWidth: CGFloat = 17
-        let spot = at.y < 30 ? CGPoint(x: at.x - 28, y: max(at.y, 11)) : CGPoint(x: at.x - 18, y: at.y - 18)
-        return CGPoint(x: min(max(spot.x, halfWidth), size.width - halfWidth), y: spot.y)
+    /// Where each point's value goes: above and left of it, which a rising curve leaves clear, or just left of it near
+    /// the top. A label that would overlap the next point's moves below and right of its point instead. Kept inside
+    /// the chart.
+    private func valuePositions(in size: CGSize) -> [CGPoint] {
+        let width: CGFloat = 36, height: CGFloat = 28
+        func inside(_ spot: CGPoint) -> CGPoint {
+            CGPoint(x: min(max(spot.x, width / 2), size.width - width / 2),
+                    y: min(max(spot.y, height / 2), size.height - height / 2))
+        }
+        var placed: [CGPoint] = []
+        for item in curve.points.reversed() {
+            let at = point(item.temperature, item.rpm, in: size)
+            let spots = [at.y < 30 ? CGPoint(x: at.x - 28, y: at.y) : CGPoint(x: at.x - 18, y: at.y - 18),
+                         CGPoint(x: at.x + 22, y: at.y + 18), CGPoint(x: at.x, y: at.y + 22)].map(inside)
+            placed.append(spots.first { spot in
+                placed.allSatisfy { abs($0.x - spot.x) >= width || abs($0.y - spot.y) >= height }
+            } ?? spots[0])
+        }
+        return placed.reversed()
     }
     private var graph: some View {
         GeometryReader { geometry in
@@ -1722,8 +1742,8 @@ struct CurveEditor: View {
             path.addLines(temperatures.map { point($0, SafeMinimum.rpm(at: $0, hardware: bounds), in: size) })
         }
         .stroke(Color.secondary, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-        // Where the Mac is now.
-        if let now = model.temperatures?.highest, now >= low, now < high {
+        // Where the curve is now, at the steadied temperature it follows.
+        if let now = model.curveTemperature, now >= low, now < high {
             Path { path in
                 path.move(to: CGPoint(x: point(now, 0, in: size).x, y: 0))
                 path.addLine(to: CGPoint(x: point(now, 0, in: size).x, y: size.height))
@@ -1733,6 +1753,7 @@ struct CurveEditor: View {
                 .position(point(now, curve.rpm(at: now), in: size))
                 .accessibilityHidden(true)
         }
+        let values = valuePositions(in: size)
         ForEach(curve.points.indices, id: \.self) { index in
             let item = curve.points[index]
             VStack(spacing: 0) {
@@ -1744,7 +1765,7 @@ struct CurveEditor: View {
             .padding(.horizontal, 2)
             .background(Color(nsColor: .windowBackgroundColor).opacity(0.75), in: RoundedRectangle(cornerRadius: 3))
             .fixedSize()
-            .position(valuePosition(point(item.temperature, item.rpm, in: size), in: size))
+            .position(values[index])
             .accessibilityHidden(true)
         }
         ForEach(curve.points.indices, id: \.self) { index in

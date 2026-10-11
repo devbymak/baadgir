@@ -209,6 +209,39 @@ check(controller.targets(desired: 3000, actual: [6000, 5800], minimums: [1000, 1
       "Leaving maximum also ramps down")
 check(controller.targets(desired: 5950, actual: [3000, 3000], minimums: [1000, 1000], maximums: [6000, 5800], now: 21.5) == [5950, 5800],
       "Rising curve applies immediately")
+var held = CurveController()
+_ = held.targets(desired: 4000, actual: [2300], minimums: [1000], maximums: [6000], now: 0)
+check(held.targets(desired: 3900, actual: [4000], minimums: [1000], maximums: [6000], now: 1) == [4000],
+      "A small drop holds the speed, so the fans don't hunt")
+check(held.targets(desired: 3800, actual: [4000], minimums: [1000], maximums: [6000], now: 2) == [3900],
+      "A larger drop starts ramping down")
+check(held.targets(desired: 3800, actual: [3900], minimums: [1000], maximums: [6000], now: 3) == [3800],
+      "Once started, the ramp goes all the way down")
+check(held.targets(desired: 3700, actual: [3800], minimums: [1000], maximums: [6000], now: 4) == [3800],
+      "After reaching the curve, small drops hold again")
+check(held.targets(desired: 3850, actual: [3800], minimums: [1000], maximums: [6000], now: 5) == [3850],
+      "Any rise applies at once")
+var steady = SteadyTemperature()
+check(steady.update(60, now: 0) == 60, "Steady temperature starts at the first reading")
+let risen = steady.update(70, now: 6)
+check(risen > 66 && risen < 67, "A rise is mostly followed within its time constant")
+var falling = SteadyTemperature()
+_ = falling.update(70, now: 0)
+let fallen = falling.update(60, now: 6)
+check(fallen > 67 && fallen < 68, "A fall is followed more slowly than a rise")
+var swinging = SteadyTemperature()
+var swings: [Double] = []
+for second in 0..<300 { swings.append(swinging.update(second % 2 == 0 ? 60 : 71, now: Double(second))) }
+check(swings.suffix(60).allSatisfy { $0 > 67 && $0 < 70 }, "A reading swinging 60–71°C every second steadies within 3°C, toward the hot end")
+let swingingTemperatures = try Temperatures(cpu: [80], gpu: [40])
+check(CoolingPolicy.curveSpeed(curve, swingingTemperatures, following: 60, thermal: .nominal, hardware: hardware) == .infinity,
+      "The stop limit uses the raw reading, not the steadied one")
+check(CoolingPolicy.curveSpeed(curve, hot, following: 55, thermal: .nominal, hardware: hardware) == .infinity,
+      "A steadied temperature never delays maximum at the stop limit")
+try check(CoolingPolicy.curveSpeed(curve, cool, following: 65, thermal: .nominal, hardware: hardware)
+      == CoolingPolicy.curveSpeed(curve, try Temperatures(cpu: [65], gpu: [40]), thermal: .nominal, hardware: hardware)
+      && CoolingPolicy.curveSpeed(curve, cool, following: 65, thermal: .nominal, hardware: hardware) != 2500,
+      "The curve looks up the steadied temperature, not the raw one")
 var idle = CurveController()
 check(idle.targets(desired: 1200, actual: [0, 0], minimums: [1200, 1000], maximums: [6000, 5800], now: 0) == nil,
       "A stopped fan counts as its minimum, so the curve's lowest speed leaves it with macOS")
