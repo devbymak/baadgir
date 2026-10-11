@@ -1343,6 +1343,12 @@ struct SettingsView: View {
 
     @ViewBuilder private var appearance: some View {
         Section {
+            Picker("Layout", selection: $model.stacksMenuBarReadings) {
+                Text("Side by side").tag(false)
+                Text("Stacked").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .disabled(model.shownMenuBarReadings.count < 2)  // One reading has nothing to stack.
             VStack(alignment: .leading, spacing: 8) {
                 Text("Readings")
                 let readings = TemperatureReading.available(fanless: model.fanless)
@@ -1359,12 +1365,6 @@ struct SettingsView: View {
                     }
                 }
             }
-            Picker("Layout", selection: $model.stacksMenuBarReadings) {
-                Text("Side by side").tag(false)
-                Text("Stacked").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .disabled(model.shownMenuBarReadings.count < 2)  // One reading has nothing to stack.
             Toggle(model.fanless ? "Thermometer icon" : "Fan icon", isOn: $model.showsMenuBarIcon)
             Toggle(isOn: $model.colorsTemperatures) {
                 Text("Color by heat")
