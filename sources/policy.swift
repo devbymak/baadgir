@@ -419,7 +419,8 @@ struct CoolingPolicy {
         (temperatures.battery.map { $0 < batteryLimit } ?? true) && (temperatures.ssd.map { $0 < ssdLimit } ?? true)
     }
     /// Curve speed for the current readings, never below the safe minimum; infinity (all fans at maximum) when it's hot.
-    /// `following` is the steadied temperature the curve looks up; the cutoffs always use the raw readings.
+    /// `following` is the steadied temperature the curve looks up; the safe minimum and the cutoffs always use the raw
+    /// readings, so smoothing never delays them.
     static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, following: Double? = nil,
                            thermal: ThermalLevel, hardware: HardwareBounds) -> Double {
         guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
