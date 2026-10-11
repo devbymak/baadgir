@@ -630,15 +630,6 @@ final class CoolingModel: ObservableObject {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
     /// Shows Manual, which can hold the fans below the safe minimum. Off until turned on.
-    @Published var advanced = UserDefaults.standard.bool(forKey: "advancedMode") {
-        didSet {
-            defaults.set(advanced, forKey: "advancedMode")
-            // Turning it off ends a running Manual session rather than leaving a hidden mode in charge.
-            if !advanced, sessionRunning, mode == .manual { select(.auto) }
-        }
-    }
-    /// Manual is offered while Advanced is on, or while the fans are in it, so the current mode always shows.
-    var offersManual: Bool { advanced || displayedMode == .manual }
     /// Asks in Baadgir before a request from outside starts cooling or picks a manual speed: the mode, the manual RPM,
     /// and whether it starts a session. Nil or false declines.
     var confirmRemote: ((FanMode, Double?, Bool) -> Bool)?
@@ -653,8 +644,6 @@ final class CoolingModel: ObservableObject {
         case .curve: wanted = .curve
         case .maximum: wanted = .maximum
         case .manual(let rpm):
-            // Before the confirmation, so a request for a mode that's turned off never asks anything.
-            guard advanced else { message = Self.manualOff; onUpdate?(); return }
             if let rpm, !sliderRange.contains(rpm) {
                 message = "Choose a speed within \(Int(sliderRange.lowerBound))–\(Int(sliderRange.upperBound)) RPM."
                 onUpdate?(); return
@@ -941,7 +930,7 @@ final class CoolingModel: ObservableObject {
         guard let last = defaults.string(forKey: "lastMode").flatMap(FanMode.init(rawValue:)), last != .auto, !fanless,
               !sessionRunning, ProcessInfo.processInfo.systemUptime - launchedAt < 30 else { restoredLastMode = true; return }
         // Not allowed now, rather than not ready yet: never start it later behind the person's back.
-        guard last != .manual || advanced, rules.blocker(for: last, on: currentPowerSource()) == nil else {
+        guard rules.blocker(for: last, on: currentPowerSource()) == nil else {
             restoredLastMode = true; return
         }
         guard !externallyControlled else { return }
@@ -984,9 +973,7 @@ final class CoolingModel: ObservableObject {
         guard temperatures != nil else { return "Temperature readings are unavailable; keeping automatic cooling" }
         return nil
     }
-    private static let manualOff = "Fixed is an advanced mode. Turn on Advanced in Settings › Fans to use it."
     private func manualBlocker() -> String? {
-        guard advanced else { return Self.manualOff }
         guard let bounds, let minimum, let maximum else { return "Fan limits are unavailable." }
         do {
             try SensorKeys.requireKnown(chipGeneration)
@@ -1199,7 +1186,7 @@ struct PopoverView: View {
                 Picker("Fan mode", selection: Binding(get: { model.displayedMode }, set: { model.choose($0) })) {
                     Text("Off").tag(FanMode.auto)
                     Text("Curve").tag(FanMode.curve)
-                    if model.offersManual { Text("Fixed").tag(FanMode.manual) }
+                    Text("Fixed").tag(FanMode.manual)
                     // Max lives in the right-click menu and ⌃⌥M; shown here only while it runs, so the mode always shows.
                     if model.displayedMode == .maximum { Text("Max").tag(FanMode.maximum) }
                 }
@@ -1255,7 +1242,7 @@ struct PopoverView: View {
         case .auto where model.externallyControlled:
             return "Choose Off to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. \(model.advanced ? "Curve and Fixed stay" : "Curve stays") on until you choose Off, and starts again when Baadgir opens. For full speed, right-click the menu bar icon or press ⌃⌥M."
+            return "macOS controls the fans. Curve and Fixed stay on until you choose Off, and starts again when Baadgir opens. For full speed, right-click the menu bar icon or press ⌃⌥M."
         case .curve:
             return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Hands the fans back to macOS on sleep or quit."
         case .manual:
@@ -1429,29 +1416,18 @@ struct SettingsView: View {
         }
         .disabled(model.bounds == nil)
         Section {
-            Toggle(isOn: $model.advanced) {
-                Text("Show Fixed mode")
-                Text("Holds the fans at a speed you pick, even below the safe minimum. Hands the fans back to macOS if your Mac gets too hot.")
+            rpmField("Minimum", text: $model.minimumText)
+            rpmField("Maximum", text: $model.maximumText)
+            if model.bounds != nil && !model.rangeIsValid {
+                warning("Enter a minimum below the maximum, within the hardware range.")
             }
         } header: {
-            Text("Advanced")
+            Text("Fixed Speed Limits")
+        } footer: {
+            footer(model.bounds.map { "Sets the Fixed slider's range. Fixed can run below Curve's safe minimum, and hands the fans back to macOS if your Mac gets too hot. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Curve and Max ignore these limits." }
+                   ?? "Reading fan limits…")
         }
         .disabled(model.bounds == nil)
-        if model.advanced {
-            Section {
-                rpmField("Minimum", text: $model.minimumText)
-                rpmField("Maximum", text: $model.maximumText)
-                if model.bounds != nil && !model.rangeIsValid {
-                    warning("Enter a minimum below the maximum, within the hardware range.")
-                }
-            } header: {
-                Text("Fixed Speed Limits")
-            } footer: {
-                footer(model.bounds.map { "Sets the Fixed slider's range. \(model.fans.count > 1 ? "Your fans share" : "Your fan supports") \(Int(ceil($0.minimum)).formatted())–\(Int(floor($0.maximum)).formatted()) RPM. Curve and Max ignore these limits." }
-                       ?? "Reading fan limits…")
-            }
-            .disabled(model.bounds == nil)
-        }
     }
 
     @ViewBuilder private var automation: some View {
@@ -2109,7 +2085,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         let busy = model.pending != nil || model.fans.isEmpty
         let modes = [("Off", FanMode.auto), ("Curve", .curve),
                      ("Fixed · \(Int(model.selectedRPM.rounded()).formatted()) RPM", .manual), ("Max", .maximum)]
-        for (title, mode) in model.fanless ? [] : modes where mode != .manual || model.offersManual {
+        for (title, mode) in model.fanless ? [] : modes {
             let entry = NSMenuItem(title: title, action: busy ? nil : #selector(selectMode(_:)), keyEquivalent: "")
             entry.target = self; entry.representedObject = mode
             entry.state = model.displayedMode == mode ? .on : .off
@@ -2215,7 +2191,7 @@ let usage = """
 Usage: baadgir status | off | curve | fixed [RPM] | max
   status        Print fan and sensor readings (read-only).
   off … max     Ask the running Baadgir app to change fan mode, with the same checks as the app.
-                Fixed needs Advanced turned on in Settings › Fans. auto and manual still work.
+                auto and manual still work.
 """
 let bundleIdentifier = "local.baadgir"
 /// Sends a request to the running Baadgir (launching the installed copy if needed) through its baadgir:// link.
