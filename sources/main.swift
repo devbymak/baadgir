@@ -857,8 +857,11 @@ final class CoolingModel: ObservableObject {
         } else {
             minimumText = String(lower); maximumText = String(upper)
         }
-        selectedRPM = Double(defaults.object(forKey: "manualRPM") as? Int ?? upper)
+        let savedRPM = defaults.object(forKey: "manualRPM") as? Int
+        selectedRPM = Double(savedRPM ?? upper)
         limitsChanged()
+        // No speed picked yet: Fixed starts halfway up its range, rounded to 50 RPM, not at full speed.
+        if savedRPM == nil { selectedRPM = ((sliderRange.lowerBound + sliderRange.upperBound) / 100).rounded() * 50 }
         initializedLimits = true
         let saved = (defaults.array(forKey: "curvePoints") as? [Int]) ?? []
         let points = stride(from: 0, to: saved.count - 1, by: 2).map {
