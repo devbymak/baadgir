@@ -28,7 +28,7 @@ struct Temperatures {
     var highest: Double { max(cpu, gpu) }
     init(cpu: [Double], gpu: [Double], battery: [Double] = [], ssd: [Double] = []) throws {
         guard !cpu.isEmpty, !gpu.isEmpty else {
-            throw Failure("CPU and GPU temperature sensors are required for manual control")
+            throw Failure("CPU and GPU temperature sensors are required for fan control")
         }
         let values = cpu + gpu + battery + ssd
         guard values.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 130 }) else {
@@ -76,7 +76,7 @@ enum SensorKeys {
     /// An unknown chip's readings may come from keys that mean something else on it; it gets Auto and Max only.
     static func requireKnown(_ generation: Generation?) throws {
         guard generation != nil else {
-            throw Failure("Baadgir doesn't know this chip's temperature sensors, so only Auto and Max are available")
+            throw Failure("Baadgir doesn't know this chip's temperature sensors, so only Off and Max are available")
         }
     }
     private static func unique(_ keys: [String]) -> [String] {
@@ -448,16 +448,16 @@ struct CoolingPolicy {
                                     starting: Bool) throws {
         guard let temperatures else { throw Failure("Temperature readings are unavailable; keeping automatic cooling") }
         guard thermal == .nominal || thermal == .fair else {
-            throw Failure(starting ? "Thermal pressure is high; manual speed is unavailable"
+            throw Failure(starting ? "Thermal pressure is high; Fixed is unavailable"
                                    : "Thermal pressure is high; returning to automatic cooling")
         }
         let limit = starting ? startLimit : stopLimit
         guard temperatures.highest < limit else {
-            throw Failure(starting ? "Manual speed starts below \(Int(startLimit))°C. Use Max to cool down first."
+            throw Failure(starting ? "Fixed starts below \(Int(startLimit))°C. Use Max to cool down first."
                                    : "Temperature is high; returning to automatic cooling")
         }
         guard othersBelowLimits(temperatures) else {
-            throw Failure(starting ? "Battery or SSD is too warm for manual speed. Use Max to cool down first."
+            throw Failure(starting ? "Battery or SSD is too warm for Fixed. Use Max to cool down first."
                                    : "Battery or SSD is hot; returning to automatic cooling")
         }
     }
@@ -504,20 +504,22 @@ enum RemoteCommand: Equatable {
         case "auto": self = .auto
         case "curve": self = .curve
         case "max", "maximum": self = .maximum
-        case "manual":
+        // Off and Fixed are the names the app shows; auto and manual still work for existing Shortcuts and scripts.
+        case "off": self = .auto
+        case "fixed", "manual":
             self = .manual(rpm: try rpm.map(Self.rpm))
         // Never repeat the link's text: any web page can open one, and Baadgir would show it as its own words.
         default: throw Failure("Unknown Baadgir command")
         }
     }
-    /// Parses command-line words such as `max` or `manual 3000`.
+    /// Parses command-line words such as `max` or `fixed 3000`.
     init(arguments: [String]) throws {
         switch arguments.map({ $0.lowercased() }) {
-        case ["auto"]: self = .auto
+        case ["off"], ["auto"]: self = .auto
         case ["curve"]: self = .curve
         case ["max"], ["maximum"]: self = .maximum
-        case ["manual"]: self = .manual(rpm: nil)
-        case let words where words.count == 2 && words[0] == "manual":
+        case ["fixed"], ["manual"]: self = .manual(rpm: nil)
+        case let words where words.count == 2 && ["fixed", "manual"].contains(words[0]):
             self = .manual(rpm: try Self.rpm(words[1]))
         default: throw Failure("Unknown command")
         }
@@ -532,10 +534,10 @@ enum RemoteCommand: Equatable {
     }
     var url: URL {
         switch self {
-        case .auto: return URL(string: "baadgir://auto")!
+        case .auto: return URL(string: "baadgir://off")!
         case .curve: return URL(string: "baadgir://curve")!
         case .maximum: return URL(string: "baadgir://max")!
-        case .manual(let rpm): return URL(string: "baadgir://manual" + (rpm.map { "?rpm=\(Int($0.rounded()))" } ?? ""))!
+        case .manual(let rpm): return URL(string: "baadgir://fixed" + (rpm.map { "?rpm=\(Int($0.rounded()))" } ?? ""))!
         }
     }
 }

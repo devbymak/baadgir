@@ -264,19 +264,22 @@ rejects("Invalid power reading") { _ = try PowerReadings(system: .nan, adapter: 
 rejects("Implausible power reading") { _ = try PowerReadings(system: 900, adapter: nil) }
 for (text, command) in [("baadgir://auto", RemoteCommand.auto), ("baadgir://curve", .curve), ("BAADGIR://Max", .maximum),
                         ("baadgir://maximum", .maximum), ("baadgir://manual", .manual(rpm: nil)),
-                        ("baadgir://manual?rpm=3000", .manual(rpm: 3000))] {
+                        ("baadgir://manual?rpm=3000", .manual(rpm: 3000)), ("baadgir://off", .auto),
+                        ("baadgir://fixed", .manual(rpm: nil)), ("baadgir://fixed?rpm=2500", .manual(rpm: 2500))] {
     try check(try RemoteCommand(url: URL(string: text)!) == command, "Link \(text)")
     try check(try RemoteCommand(url: command.url) == command, "Link round trip \(text)")
 }
-for text in ["https://max", "baadgir://off", "baadgir://manual?rpm=fast", "baadgir://manual?rpm=nan", "baadgir:max",
+for text in ["https://max", "baadgir://stop", "baadgir://manual?rpm=fast", "baadgir://manual?rpm=nan", "baadgir:max",
              "baadgir://manual?rpm=1e20", "baadgir://manual?rpm=-1"] {
     rejects("Bad link \(text)") { _ = try RemoteCommand(url: URL(string: text)!) }
 }
 try check(try RemoteCommand(arguments: ["manual", "2500"]) == .manual(rpm: 2500), "Command-line manual speed")
+try check(try RemoteCommand(arguments: ["fixed", "2500"]) == .manual(rpm: 2500) && RemoteCommand(arguments: ["off"]) == .auto,
+          "Command-line Off and Fixed, the names the app shows")
 try check(try RemoteCommand(arguments: ["MAX"]) == .maximum, "Command-line words ignore case")
 try check(try RemoteCommand(url: RemoteCommand(arguments: ["manual", "20000"]).url) == .manual(rpm: 20000),
           "The largest accepted speed still forms a link")
-for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["off"], ["manual", "1e20"], ["manual", "inf"]] {
+for words in [[], ["status", "x"], ["manual", "fast"], ["manual", "1", "2"], ["stop"], ["manual", "1e20"], ["manual", "inf"]] {
     rejects("Bad command \(words)") { _ = try RemoteCommand(arguments: words) }
 }
 var rules = PowerRules()
