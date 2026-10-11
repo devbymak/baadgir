@@ -215,13 +215,16 @@ func processOwner(_ pid: pid_t) throws -> uid_t {
 }
 /// Opens the app's session folder without following links, and checks that the app's user owns it and no one else
 /// can enter it. Root then reaches the session files only through this folder, never through a swapped path.
+/// One message for every refusal: anyone can run this as root through the sudo rule, so it mustn't reveal whether a
+/// path they can't see exists, or who owns it.
 func openSessionDirectory(_ path: String, owner: uid_t) throws -> Int32 {
+    let invalid = Failure("Cooling session folder is unavailable or not private to Baadgir's user")
     let folder = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-    guard folder >= 0 else { throw Failure("Cooling session folder is unavailable") }
+    guard folder >= 0 else { throw invalid }
     var info = stat()
     guard fstat(folder, &info) == 0, info.st_uid == owner, info.st_mode & 0o077 == 0 else {
         close(folder)
-        throw Failure("Cooling session folder is not private to Baadgir's user")
+        throw invalid
     }
     return folder
 }
@@ -1412,7 +1415,7 @@ struct SettingsView: View {
         } header: {
             Text("Fan Curve")
         } footer: {
-            footer("Follows the hotter of CPU and GPU. Never runs fans slower than macOS or the safe minimum (dashed line), and goes to full speed if your Mac gets too hot. System leaves cooling to macOS and adds only the safe minimum; Balanced starts earlier; Performance runs fans hardest for the lowest temperatures.")
+            footer("Follows the hotter of CPU and GPU. Never runs fans slower than macOS was running when Curve took over, or below the safe minimum (dashed line), and goes to full speed if your Mac gets too hot. System leaves cooling to macOS and adds only the safe minimum; Balanced starts earlier; Performance runs fans hardest for the lowest temperatures.")
         }
         .disabled(model.bounds == nil)
         Section {

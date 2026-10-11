@@ -22,7 +22,7 @@ macOS keeps the fans quiet until your Mac is already hot. That's fine for email,
 
 - 🌡️ **Live temperatures in the menu bar.** CPU, GPU, battery and SSD readings, colored green, yellow or red, plus fan RPM, power draw and thermal pressure.
 - 📈 **10-minute history graphs** of temperature and fan speed, right in the popover.
-- 🌀 **Custom fan curve.** Set four temperature → RPM points. Baadgir only speeds the fans up, never runs them slower than macOS would, and enforces a safe minimum.
+- 🌀 **Custom fan curve.** Set four temperature → RPM points. Baadgir only speeds the fans up, never below the speed macOS was running when Curve took over, and enforces a safe minimum.
 - 🚀 **One-click Max.** Full fan speed from the popover, the right-click menu, or <kbd>⌃</kbd><kbd>⌥</kbd><kbd>M</kbd> from any app.
 - ⚡ **Automation.** Switch to Curve or Max when you plug in, back to Auto on battery. Also works with Shortcuts, `baadgir://` links and a command-line tool.
 - 🛡️ **Safety first.** Fans go back to macOS automatic control on quit, sleep, a crash, overheating or a sensor failure.
@@ -86,7 +86,7 @@ sudo rm -f /Library/PrivilegedHelperTools/local.baadgir.helper /var/db/local.baa
 <details>
 <summary><b>How Baadgir keeps your Mac safe</b></summary>
 
-- **Curve** never runs below a safe minimum for the current temperature (the fans' minimum up to 65°C, a quarter of their range at 72°C, half at 78°C). It switches to full speed at 80°C CPU/GPU, a 45°C battery, a 70°C SSD or high thermal pressure, and returns to Auto once macOS's own speed is enough.
+- **Curve** never runs below a safe minimum for the current temperature (the fans' minimum up to 65°C, a quarter of their range at 72°C, half at 78°C). It switches to full speed at 80°C CPU/GPU, a 45°C battery, a 70°C SSD or high thermal pressure, and returns to Auto once macOS's own speed is enough. While Curve holds the fans, macOS's live choice can't be read, so Curve won't follow a rise macOS would make for sensors Baadgir doesn't watch; the safe minimum and these cutoffs cover that.
 - **Manual** only starts below 75°C, never goes under 1000 RPM, and returns to Auto at 80°C, a hot battery or SSD, high thermal pressure or a sensor failure.
 - **Max** has no cutoff because it never lowers fan speed.
 - **Watchdogs:** the root helper restores Auto if the app stops responding for 10 seconds, and a separate watchdog restores Auto if the helper itself stalls for 15 seconds.
