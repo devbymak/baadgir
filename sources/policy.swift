@@ -375,8 +375,8 @@ struct CurveController {
 }
 
 /// The temperature Curve follows: the hottest CPU/GPU reading, steadied so brief spikes don't make the fans hunt. It
-/// follows a rise within seconds and a fall more slowly, so it errs toward cooling. Only the curve and its safe minimum
-/// use it: the stop limit, thermal pressure and the battery and SSD cutoffs still act on the raw readings.
+/// follows a rise within seconds and a fall more slowly, so it errs toward cooling. Only the curve lookup uses it: the
+/// safe minimum, the stop limit, thermal pressure and the battery and SSD cutoffs still act on the raw readings.
 struct SteadyTemperature {
     /// Time constants in seconds: about two thirds of a step is followed in this time.
     static let riseTime = 6.0, fallTime = 20.0
@@ -429,7 +429,7 @@ struct CoolingPolicy {
         let rounded = (curve.rpm(at: followed) / 50).rounded() * 50
         // Checked here as well as on the curve's points: past its last point the curve stays flat while the minimum rises.
         return max(min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm),
-                   SafeMinimum.rpm(at: followed, hardware: hardware))
+                   SafeMinimum.rpm(at: temperatures.highest, hardware: hardware))
     }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
         guard minimum.isFinite, maximum.isFinite, minimum >= hardware.minimum,

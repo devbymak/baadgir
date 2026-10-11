@@ -743,8 +743,13 @@ final class CoolingModel: ObservableObject {
             let edited = try FanCurve(zip(temperatures, speeds).map { FanCurve.Point(temperature: Double($0!), rpm: Double($1!)) })
             try edited.validate(hardware: bounds)
             curve = edited; curveError = nil
-            defaults.set(edited.points.flatMap { [Int($0.temperature), Int($0.rpm)] }, forKey: "curvePoints")
+            if !curveDragging { saveCurve(edited) }
         } catch { curveError = String(describing: error) }
+    }
+    /// While a point is dragged the curve updates live, but is saved once, when the drag ends.
+    var curveDragging = false { didSet { if !curveDragging, oldValue, let curve { saveCurve(curve) } } }
+    private func saveCurve(_ curve: FanCurve) {
+        defaults.set(curve.points.flatMap { [Int($0.temperature), Int($0.rpm)] }, forKey: "curvePoints")
     }
     private func showCurve(_ curve: FanCurve) {
         fillingCurve = true  // Fill every field before validating.
@@ -919,18 +924,26 @@ final class CoolingModel: ObservableObject {
     /// A mode picked by hand, from the popover, the menu, the hot key or a link. Remembered so Baadgir starts it again
     /// when it next opens; modes set by rules, returns to Auto for safety, sleep and quitting don't change it.
     func choose(_ newMode: FanMode) {
-        defaults.set(newMode.rawValue, forKey: "lastMode")
+        restoredLastMode = true  // A pick by hand replaces any restore still waiting at launch.
         select(newMode)
+        // Only a mode that took effect: a refused pick mustn't start by itself at the next launch.
+        if newMode == .auto || (sessionRunning && mode == newMode) { defaults.set(newMode.rawValue, forKey: "lastMode") }
     }
     private var restoredLastMode = false
-    /// Once at launch, after limits and the curve are loaded: starts the mode last picked by hand.
+    private let launchedAt = ProcessInfo.processInfo.systemUptime
+    /// At launch, after limits and the curve are loaded: starts the mode last picked by hand. Retried on each read for
+    /// the first 30 seconds, since fans still settling or readings not in yet can refuse it at first.
     private func restoreLastMode() {
         guard !restoredLastMode, initializedLimits, pending == nil else { return }
-        restoredLastMode = true
-        guard let last = defaults.string(forKey: "lastMode").flatMap(FanMode.init(rawValue:)), last != .auto,
-              !fanless, !sessionRunning, !externallyControlled, last != .manual || advanced,
-              rules.blocker(for: last, on: currentPowerSource()) == nil else { return }
+        guard let last = defaults.string(forKey: "lastMode").flatMap(FanMode.init(rawValue:)), last != .auto, !fanless,
+              !sessionRunning, ProcessInfo.processInfo.systemUptime - launchedAt < 30 else { restoredLastMode = true; return }
+        // Not allowed now, rather than not ready yet: never start it later behind the person's back.
+        guard last != .manual || advanced, rules.blocker(for: last, on: currentPowerSource()) == nil else {
+            restoredLastMode = true; return
+        }
+        guard !externallyControlled else { return }
         select(last)
+        if sessionRunning { restoredLastMode = true }
     }
     func select(_ newMode: FanMode) {
         message = nil
@@ -1060,7 +1073,8 @@ final class CoolingModel: ObservableObject {
     /// Whether starting a session raises the administrator prompt.
     var needsPassword: Bool { !FileManager.default.fileExists(atPath: sudoRulePath) }
     /// Runs the root-owned helper as root. Returns nil if it could not launch.
-    private func runPrivileged(_ arguments: [String], completion: @escaping (Bool, String) -> Void) -> PrivilegedLaunch? {
+    private func runPrivileged(_ arguments: [String], prompting: Bool = false,
+                               completion: @escaping (Bool, String) -> Void) -> PrivilegedLaunch? {
         // Never run as root, or hand the administrator password to, a file that another app running as this user could replace.
         guard isRootOwned(helperPath) else {
             message = "The fan-control helper is not installed. Run ./build.sh --install."; return nil
@@ -1073,7 +1087,7 @@ final class CoolingModel: ObservableObject {
         let command = ["/usr/bin/env", "-i", helperPath] + arguments
         let process = Process()
         let launch: PrivilegedLaunch
-        if !needsPassword {
+        if !prompting, !needsPassword {
             // -n: fail rather than wait for a password nobody can type.
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
             process.arguments = ["-n"] + command
@@ -1092,6 +1106,12 @@ final class CoolingModel: ObservableObject {
                 guard let self else { return }
                 let success = completed.terminationStatus == 0
                 self.helper = nil
+                // The rule file exists but doesn't cover this account (or sudo ignored it): ask for the password instead.
+                if launch == .direct, !success, error.contains("a password is required"),
+                   self.runPrivileged(arguments, prompting: true, completion: completion) != nil {
+                    if self.sessionRunning { self.pending = "Waiting for administrator authorization…" }
+                    return
+                }
                 // The last sensor read may predate restoration; don't report a stuck fan from it.
                 self.settlingUntil = Date().addingTimeInterval(2)
                 let readable = Self.readableError(error)
@@ -1696,19 +1716,25 @@ struct CurveEditor: View {
             ZStack(alignment: .topLeading) { chart(in: size) }
                 .frame(width: size.width, height: size.height, alignment: .topLeading)
                 .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                // A real drag that starts on or near a point: a click, or a drag elsewhere on the chart, changes nothing.
+                .gesture(DragGesture(minimumDistance: 2).onChanged { gesture in
                     if drag.index == nil {
                         func distance(_ index: Int) -> CGFloat {
                             let at = point(curve.points[index].temperature, curve.points[index].rpm, in: size)
                             return hypot(at.x - gesture.startLocation.x, at.y - gesture.startLocation.y)
                         }
-                        drag.index = curve.points.indices.min { distance($0) < distance($1) }
+                        guard let nearest = curve.points.indices.min(by: { distance($0) < distance($1) }),
+                              distance(nearest) <= 20 else { return }
+                        drag.index = nearest
+                        model.curveDragging = true
                     }
                     guard let index = drag.index else { return }
                     let target = value(at: gesture.location, in: size)
                     model.moveCurvePoint(index, temperature: target.temperature, rpm: target.rpm)
                 }.onEnded { _ in
+                    guard drag.index != nil else { return }
                     drag.index = nil
+                    model.curveDragging = false
                     model.heartbeat()  // Send the new curve now rather than at the next second.
                 })
         }
@@ -2197,8 +2223,9 @@ func send(_ command: RemoteCommand) -> Int32 {
     do { try open.run(); open.waitUntilExit() } catch { fputs("\(error)\n", stderr); return 1 }
     return open.terminationStatus
 }
-// No logs: nothing here writes readings to disk. `--probe` and `status` print to the terminal only.
-if arguments.contains("--probe") || arguments.dropFirst() == ["status"] {
+// No logs: nothing here writes readings to disk. `--probe` and `status` print to the terminal only. Matched exactly, so
+// the sudo rule's `--control *` can't reach them.
+if arguments.dropFirst() == ["--probe"] || arguments.dropFirst() == ["status"] {
     print(diagnostic())
 } else if arguments.count == 4 && arguments[1] == "--control" {
     do {

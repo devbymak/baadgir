@@ -242,6 +242,8 @@ try check(CoolingPolicy.curveSpeed(curve, cool, following: 65, thermal: .nominal
       == CoolingPolicy.curveSpeed(curve, try Temperatures(cpu: [65], gpu: [40]), thermal: .nominal, hardware: hardware)
       && CoolingPolicy.curveSpeed(curve, cool, following: 65, thermal: .nominal, hardware: hardware) != 2500,
       "The curve looks up the steadied temperature, not the raw one")
+try check(CoolingPolicy.curveSpeed(lowCurve, try Temperatures(cpu: [78], gpu: [40]), following: 60, thermal: .nominal, hardware: hardware)
+      == SafeMinimum.rpm(at: 78, hardware: hardware), "The safe minimum follows the raw reading, so smoothing never delays it")
 var idle = CurveController()
 check(idle.targets(desired: 1200, actual: [0, 0], minimums: [1200, 1000], maximums: [6000, 5800], now: 0) == nil,
       "A stopped fan counts as its minimum, so the curve's lowest speed leaves it with macOS")
