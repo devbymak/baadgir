@@ -253,8 +253,9 @@ func readControl(in folder: Int32, owner: uid_t) throws -> (target: CoolingTarge
     defer { close(file) }
     var info = stat()
     // The app's own single-link file only: a hard link could otherwise point root at a file the user cannot read.
+    // No links at all is fine: the app's next atomic write replaced this file after it was opened.
     guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 64,
-          info.st_uid == owner, info.st_nlink == 1 else {
+          info.st_uid == owner, info.st_nlink <= 1 else {
         throw Failure("Cooling controls are invalid")
     }
     var buffer = [UInt8](repeating: 0, count: 64)
