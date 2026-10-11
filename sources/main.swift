@@ -334,16 +334,17 @@ func coolingSession(parent: pid_t, directory: String) throws {
             retryDelay: { usleep(100_000) })
     }
     /// Targets written recently. The SMC applies a new target a moment after the write and can drop one that follows
-    /// another closely, so reading back the latest or any written within `settle` still means Baadgir holds the fan;
-    /// any other value means something else changed it.
+    /// another closely, so reading back the latest, or one replaced within `settle`, still means Baadgir holds the fan;
+    /// any other value means something else changed it. Timed from the replacement, not the write: Curve can hold one
+    /// speed for minutes before stepping down.
     var written: [(targets: [Float], at: ContinuousClock.Instant)] = []
     let settle = Duration.seconds(5)
     /// Per-fan targets while Baadgir holds the fans; nil while macOS controls them (Curve mode only).
     var applied: [Float]? {
         didSet {
-            guard let applied else { return }
-            written.removeAll { $0.at.duration(to: .now) > settle }
+            guard let applied else { written.removeAll(); return }
             written.append((applied, .now))
+            while written.count > 1, written[1].at.duration(to: .now) > settle { written.removeFirst() }
         }
     }
     /// Puts every fan in manual mode, writing the target first so no fan runs a stale value.
@@ -447,7 +448,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
                 }
                 let expected = applied[index], target = try smc.number("F\(fan.index)Tg")
                 let ours = written.indices.contains {
-                    ($0 == written.count - 1 || written[$0].at.duration(to: now) <= settle)
+                    ($0 == written.count - 1 || written[$0 + 1].at.duration(to: now) <= settle)
                         && abs(target - written[$0].targets[index]) <= 1
                 }
                 guard fan.mode == 1, ours else {
